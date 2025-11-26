@@ -109,7 +109,7 @@ class GPModel(ExactGP):
 		pred = self.predict(rcond=rcond)
 
 		# clone training data
-		inp_y = model.train.targets.clone()
+		inp_y = self.train_targets.clone()
 		inp_y[flags] = pred[flags]
 
 		# add centering if needed
