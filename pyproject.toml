@@ -1,0 +1,41 @@
+[build-system]
+requires = ['setuptools']
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gprlim"
+description = 'Gaussian Process Regression for LIM Cosmology'
+authors = [{name="Nicholas Kern"}]
+classifiers = [
+    "Topic :: Scientific/Engineering :: Astronomy",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = [
+    "numpy",
+    "scipy",
+    "mpmath",
+    "matplotlib",
+    "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "coverage",
+]
+docs = [
+    "gprlim[dev]",
+    "furo",
+    "nbsphinx",
+    "sphinx>=1.8,<7.2",
+    "myst-nb",
+    "myst_parser",
+]
+
+[tool.pytest.ini_options]
+addopts = "--cov gprlim --cov-config=.coveragerc --cov-report xml:./coverage.xml"
+testpaths = 'gprlim/tests'
+filterwarnings = ["ignore::DeprecationWarning"]
+
