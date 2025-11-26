@@ -24,7 +24,7 @@ class GPModel(ExactGP):
 	"""
 	Subclass of gpytorch.model.ExactGP
 	"""
-	def __init__(self, train_x, train_y, likelihood, mean, covar, y_offset=None):
+	def __init__(self, train_x, train_y, likelihood, mean, covar):
 		"""
 		Parameters
 		----------
@@ -38,20 +38,17 @@ class GPModel(ExactGP):
 			The mean function
 		covar : Kernel object
 			The covariance function
-		y_offset : Tensor
-			Centering of training targets.
 		"""
 		super(GPModel, self).__init__(train_x, train_y, likelihood)
 		self.mean = mean
 		self.covar = covar
-		self.y_offset = y_offset
 
 	def forward(self, x):
 		mean_x = self.mean(x)
 		covar_x = self.covar(x)
 		return MultivariateNormal(mean_x, covar_x)
 
-	def predict(self, input_x=None):
+	def predict(self, input_x=None, rcond=1e-15):
 		"""
 		Get MAP prediction
 			Cp (Cs + Cn)^-1 y
@@ -72,11 +69,22 @@ class GPModel(ExactGP):
 
 			# compute Cs and Cn
 			Cs = self.covar(self.train_inputs[0]).to_dense().squeeze()
-			pred = gp_predict(Cs, Cn, train_y, Cp=Cp, rcond=1e-15)
+			Cn = self.likelihood.noise.detach()
+			if input_x is not None:
+				Cp = self.covar(input_x).to_dense().squeeze()
+				mu = self.mean(input_x).to_dense().squeeze()
+			else:
+				Cp = Cs
 
+			# compute MAP
+			pred = gp_predict(Cs, Cn, y, Cp=Cp, rcond=rcond)
 
+			# add back mean
+			pred += mu
 
-	def inpaint(self, flags):
+		return pred
+
+	def inpaint(self, flags, y_offset=None, to_complex=False, rcond=1e-15):
 		"""
 		Inpaint the training data at flagged pixels
 
@@ -84,26 +92,35 @@ class GPModel(ExactGP):
 		----------
 		flags : tensor
 			Flagged pixels ([Nbatch], Nsamples)
+		y_offset : tensor
+			Pre-centering of training data to add after
+			inpainting
+		to_complex : bool
+			If True, assume training data [real, imag] are stacked,
+			convert back to complex
+		rcond : float
+			relative condition for matrix inverse
 
 		Returns
 		-------
 		tensor
 		"""
+		# get MAP prediction of training data
+		pred = self.predict(rcond=rcond)
 
+		# clone training data
+		inp_y = model.train.targets.clone()
+		inp_y[flags] = pred[flags]
 
+		# add centering if needed
+		if y_offset is not None:
+			inp_y += y_offset
 
-		model.eval()
-		model.likelihood.eval()
-		with torch.no_grad():
-			pred = model(model.train_inputs[0])
+		# turn to complex if needed
+		if to_complex:
+			inp_y = torch.complex(inp_y[:len(inp_y)//2], inp_y[len(inp_y)//2:])
 
-		# make copy of training data with prediction in flags
-		inp_y = model.train_targets.clone()
-		inp_y[flags] = pred.mean[flags]
-
-		# add back offset if needed
-		if hasattr(model, 'y_offset') and model.y_offset is not None:
-			inp_y += model.y_offset
+		return inp_y
 
 
 def fixednoise_gp_1d(
@@ -135,7 +152,10 @@ def fixednoise_gp_1d(
 
 	Returns
 	-------
-	GPModel object
+	model : GPModel object
+		The GP model
+	y_offset : tensor
+		The centering of the training data.
 	"""
 	# setup likelihood
 	likelihood = FixedNoiseGaussianLikelihood(inv_wgts)
@@ -152,7 +172,7 @@ def fixednoise_gp_1d(
 	# setup GP model
 	model = GPModel(train_x, train_y, likelihood, mean, covar, y_offset=y_offset)
 
-	return model
+	return model, y_offset
 
 
 def woodbury(A, U):
