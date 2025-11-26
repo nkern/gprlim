@@ -170,7 +170,7 @@ def fixednoise_gp_1d(
 		train_y = train_y - y_offset
 
 	# setup GP model
-	model = GPModel(train_x, train_y, likelihood, mean, covar, y_offset=y_offset)
+	model = GPModel(train_x, train_y, likelihood, mean, covar)
 
 	return model, y_offset
 
