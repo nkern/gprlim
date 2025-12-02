@@ -17,6 +17,7 @@ dynamic = ["version"]
 [project.optional-dependencies]
 dev = [
     "numpy",
+    "gpytorch",
     "scipy",
     "mpmath",
     "matplotlib",
