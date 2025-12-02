@@ -84,7 +84,7 @@ class GPModel(ExactGP):
 
 		return pred
 
-	def inpaint(self, flags, y_offset=None, to_complex=False, rcond=1e-15):
+	def inpaint(self, flags, y_offset=None, to_complex=False, rcond=1e-15, return_model=False):
 		"""
 		Inpaint the training data at flagged pixels
 
@@ -100,6 +100,9 @@ class GPModel(ExactGP):
 			convert back to complex
 		rcond : float
 			relative condition for matrix inverse
+		return_model : bool
+			If True, return just the model. 
+			Otherwise return the inpainted data (default)
 
 		Returns
 		-------
@@ -108,9 +111,12 @@ class GPModel(ExactGP):
 		# get MAP prediction of training data
 		pred = self.predict(rcond=rcond)
 
-		# clone training data
-		inp_y = self.train_targets.clone()
-		inp_y[flags] = pred[flags]
+		if return_model:
+			inp_y = pred
+		else:
+			# clone training data
+			inp_y = self.train_targets.clone()
+			inp_y[flags] = pred[flags]
 
 		# add centering if needed
 		if y_offset is not None:
