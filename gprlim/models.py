@@ -350,8 +350,11 @@ def multi_kernel_mixture(
 	mean_bound_constant=None,
 	Nbatch=0,
 	nonstn_scale=False,
-	train_x=None,
+	nonstn_fix=False,
+	nonstn_set=None,
 	nonstn_prior=None,
+	nonstn_bound=None,
+	train_x=None,
 	kern0='sinc',
 	**kwgs,
 	):
@@ -382,12 +385,16 @@ def multi_kernel_mixture(
 	nonstn_scale : bool
 		If True, multiply a NonStationaryScale kernel at the end of
 		the covariance mixture.
-	train_x : tensor
-		Needed for NonStationaryScaleKernel instantiation
+	nonstn_fix : bool
+		If True, fix the non-stationary coefficient
+	nonstn_set : float
+		Set the value of the non-stationary coefficient
 	nonstn_prior : Prior object
 		Prior for nonstationary scale parameter.
 	nonstn_bound : Internval object
 		Bounds for nonstationary scale parameter.
+	train_x : tensor
+		Needed for NonStationaryScaleKernel instantiation
 	kern0 : str
 		If passed, create a kern0 object, with the following
 		optional parameters. Options are ['sinc', 'rbf'].
@@ -472,6 +479,10 @@ def multi_kernel_mixture(
 				'lengthscale',
 				nonstn_bound
 			)
+		if nonstn_fix:
+			covar.kernels[0].raw_lengthscale.requires_grad = False
+		if nonstn_set is not None:
+			covar.kernels[0].lengthscale = nonstn_set
 		if nonstn_prior is not None:
 			covar.kernels[0].register_prior(
 				'lengthscale_prior',
