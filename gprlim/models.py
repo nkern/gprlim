@@ -84,7 +84,7 @@ class GPModel(ExactGP):
 
 		return pred
 
-	def inpaint(self, flags, y_offset=None, to_complex=False, rcond=1e-15, return_model=False):
+	def inpaint(self, flags, y_offset=None, y_scale=None, to_complex=False, rcond=1e-15, return_model=False):
 		"""
 		Inpaint the training data at flagged pixels
 
@@ -95,6 +95,9 @@ class GPModel(ExactGP):
 		y_offset : tensor
 			Pre-centering of training data to add after
 			inpainting
+		y_scale : tensor
+			Pre-scaling of training data to multiply
+			after inpainting and re-centering
 		to_complex : bool
 			If True, assume training data [real, imag] are stacked,
 			convert back to complex
@@ -121,6 +124,10 @@ class GPModel(ExactGP):
 		# add centering if needed
 		if y_offset is not None:
 			inp_y += y_offset
+
+		# scale if needed
+		if y_scale is not None:
+			inp_y *= y_scale
 
 		# turn to complex if needed
 		if to_complex:
