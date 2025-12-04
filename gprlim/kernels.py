@@ -79,8 +79,8 @@ class NonStationaryScaleKernel(Kernel):
 			self.register_prior(
 				"lengthscale_prior", lengthscale_prior, self._lengthscale_param, self._lengthscale_closure
 			)
-			# not enforced...
-			self.register_constraint("raw_lengthscale", Interval(-1,1,None,None))
+			# set interval of -1, 1
+			self.register_constraint("raw_lengthscale", Interval(-1, 1, torch.tanh, torch.atanh))
 
 		self.distance_module = None
 		# TODO: Remove this on next official PyTorch release.
@@ -98,6 +98,29 @@ class NonStationaryScaleKernel(Kernel):
 		if diag:
 			return k1 * k2
 
+		else:
+			return k1.unsqueeze(-1) * k2.unsqueeze(-2)
+
+
+class FixedNonStationaryKernel(Kernel):
+	r"""
+	A fixed non-stationary kernel
+	"""
+	has_lengthscale = False
+
+	def __init__(self, func):
+
+		super(Kernel, self).__init__()
+
+		self.func = func
+
+	def forward(self, x1, x2, diag=False, **params):
+		# compute k1 and k2
+		k1 = self.func(x1).sum(-1)
+		k2 = self.func(x2).sum(-1)
+
+		if diag:
+			return k1 * k2
 		else:
 			return k1.unsqueeze(-1) * k2.unsqueeze(-2)
 
