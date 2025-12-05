@@ -84,7 +84,7 @@ class GPModel(ExactGP):
 
 		return pred
 
-	def inpaint(self, flags, y_offset=None, y_scale=None, to_complex=False, rcond=1e-15, return_model=False):
+	def inpaint(self, flags, y_offset=None, y_scale=None, to_complex=False, rcond=1e-15):
 		"""
 		Inpaint the training data at flagged pixels
 
@@ -103,37 +103,37 @@ class GPModel(ExactGP):
 			convert back to complex
 		rcond : float
 			relative condition for matrix inverse
-		return_model : bool
-			If True, return just the model. 
-			Otherwise return the inpainted data (default)
 
 		Returns
 		-------
-		tensor
+		inp_y : tensor
+			Inpainted data
+		mdl : tensor
+			Inpaint model
 		"""
 		# get MAP prediction of training data
-		pred = self.predict(rcond=rcond)
+		mdl = self.predict(rcond=rcond)
 
-		if return_model:
-			inp_y = pred
-		else:
-			# clone training data
-			inp_y = self.train_targets.clone()
-			inp_y[flags] = pred[flags]
+		# clone training data
+		inp_y = self.train_targets.clone()
+		inp_y[flags] = mdl[flags]
 
 		# add centering if needed
 		if y_offset is not None:
 			inp_y += y_offset
+			mdl += y_offset
 
 		# scale if needed
 		if y_scale is not None:
 			inp_y *= y_scale
+			mdl *= y_scale
 
 		# turn to complex if needed
 		if to_complex:
 			inp_y = torch.complex(inp_y[:len(inp_y)//2], inp_y[len(inp_y)//2:])
+			mdl = torch.complex(mdl[:len(mdl)//2], mdl[len(mdl)//2:])
 
-		return inp_y
+		return inp_y, mdl
 
 
 def fixednoise_gp_1d(
@@ -198,8 +198,8 @@ def woodbury(A, U):
 	A : tensor
 	    Diagonal matrix of shape (Nsamples,)
 	U : tensor
-	    SVD decomposition matrix of shape (Nsamples, Nmodes)
-	    where Nmodes < Nsamples
+		SVD decomposition matrix of shape (Nsamples, Nmodes)
+		where Nmodes < Nsamples
 	    
 	Returns
 	-------
