@@ -249,7 +249,7 @@ def gpr_invert(C, N, B=None, y=None, rcond=1e-15):
 			# revert to slow pinv per batch
 			out = []
 			for i in range(len(N)):
-				out.append(gpr_invert(C[i], C[i], B=B[i], y=y[i], rcond=rcond))
+				out.append(gpr_invert(C[i], N[i], B=B[i], y=y[i], rcond=rcond))
 
 
 		else:
