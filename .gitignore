@@ -5,7 +5,9 @@
 .DS_Store
 build/*
 coverage.xml
-\.ipynb_checkpoints/
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
 *.pyc
+*/*.pyc
 dist/*
 docs/_build/*
