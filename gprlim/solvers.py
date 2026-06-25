@@ -115,7 +115,7 @@ def pcg(A, b, M=None, tol=1e-6, max_iter=1000, x0=None):
 # --------------------------------------------------------------------------------------
 def diag_preconditioner(diag):
     """Jacobi preconditioner ``M^-1 r = r / diag`` for a diagonal ``M`` of shape (..., n)
-    (e.g. ``diag = A.diagonal()``): cheap, and tames a FLAG_VAR-heavy noise diagonal."""
+    (e.g. ``diag = A.diagonal()``): cheap, and tames a flag-heavy (high-variance) noise diagonal."""
     return lambda r: r / diag
 
 
@@ -275,7 +275,7 @@ def kron_woodbury_predict(Ct, Cf, noise, y, rcond=1e-12):
     ``U = U_t (x) U_f`` (the per-axis eigendecompositions truncated at ``rcond``): only
     a ``(k_t*k_f) x (k_t*k_f)`` capacitance is inverted, so this is a *direct*, high-
     dynamic-range-safe solve -- a Cholesky of that small capacitance, no CG / no iteration
-    -- and a flagged-pixel ``FLAG_VAR`` enters benignly as ``1/FLAG_VAR``. It is the dual
+    -- and a large flagged-pixel variance enters benignly as its reciprocal. It is the dual
     of the structured per-baseline solve of :func:`gprlim.workflows.inpaint`
     (``mode='joint'``): a win exactly when the kernels are low rank (the smooth-kernel
     regime); for full-rank kernels the capacitance is ``N x N`` and a dense / CG solve is

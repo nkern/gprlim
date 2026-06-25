@@ -21,6 +21,14 @@ BL_VECS = torch.tensor([[14.6, 0.0, 0.0]], dtype=torch.float64)    # meters (ENU
 LAT = -30.72                                                       # degrees
 
 
+def _flagged_noise(noise, flags, big=1e12):
+    """New inpaint contract: the caller down-weights flagged pixels (large variance);
+    inpaint no longer injects this. Returns a copy of ``noise`` with flags -> ``big``."""
+    noise = noise.clone()
+    noise[flags] = big
+    return noise
+
+
 def _real_kernels():
     """Explicit real (Sinc/RBF) freq + time kernels for the real-core tests (the default
     time kernel is complex, so the real-core paths must supply their own)."""
@@ -79,6 +87,7 @@ def test_inpaint_freq_real_data():
 
     torch.manual_seed(0)
     noise = 0.05 ** 2 * torch.ones_like(data.real)                 # (Nbls, Nt, Nf) per-baseline
+    noise = _flagged_noise(noise, flags)                           # caller down-weights flags
     out = inpaint(data, flags, t, nu, noise=noise, bl_vecs=BL_VECS, fit=True, fit_iter=20, fit_nsamp=128)
 
     assert out.shape == data.shape and out.is_complex()
@@ -96,6 +105,7 @@ def test_inpaint_handles_2d_and_shared_noise():
 
     torch.manual_seed(0)
     noise = 0.05 ** 2 * torch.ones(1, *data2d.shape)              # (1, Nt, Nf) shared
+    noise = _flagged_noise(noise, flags2d[None])                  # caller down-weights flags
     out = inpaint(data2d, flags2d, t, nu, noise=noise, bl_vecs=BL_VECS, fit=True, fit_iter=20, fit_nsamp=128)
 
     assert out.shape == data2d.shape
@@ -109,7 +119,8 @@ def test_inpaint_joint_real_data():
     data, flags, t, nu = _load(nbls=2, ntimes=40, fslice=slice(60, 140))
 
     torch.manual_seed(0)
-    noise = 0.05 ** 2 * torch.ones(1, *data.shape[1:])
+    noise = 0.05 ** 2 * torch.ones_like(data.real)               # (Nbls, Nt, Nf) per-baseline
+    noise = _flagged_noise(noise, flags)                         # caller down-weights flags
     out = inpaint(data, flags, t, nu, noise=noise, mode="joint", bl_vecs=BL_VECS, latitude=LAT,
                   fit=True, fit_iter=20, fit_nsamp=128)
 
@@ -174,6 +185,7 @@ def test_joint_shared_equals_per_baseline_loop():
     Nbls = data.shape[0]
     shared_flags = flags[:1]                                               # (1, Nt, Nf) -> shared
     shared_noise = 0.05 ** 2 * torch.ones(1, *data.shape[1:], dtype=data.real.dtype)
+    shared_noise = _flagged_noise(shared_noise, shared_flags)              # caller down-weights flags
 
     fk, tk = _real_kernels()                                               # real cores -> real path
     with gpytorch.settings.max_cholesky_size(100000):                      # force exact solve
@@ -241,6 +253,7 @@ def test_freq_accepts_shared_flags():
     data, flags, t, nu = _load(nbls=3, ntimes=40)
     shared_flags = flags[:1]
     shared_noise = 0.05 ** 2 * torch.ones(1, *data.shape[1:], dtype=data.real.dtype)
+    shared_noise = _flagged_noise(shared_noise, shared_flags)             # caller down-weights flags
 
     out = inpaint(data, shared_flags, t, nu, noise=shared_noise, bl_vecs=BL_VECS, fit=True,
                   fit_iter=15, fit_nsamp=128)
@@ -269,17 +282,16 @@ def test_inpaint_joint_woodbury_complex():
     flags = torch.zeros(2, Nt, Nf, dtype=bool)
     flags[:, 4, :] = True            # a fully-flagged time integration
     flags[:, :, 5] = True            # a fully-flagged channel
-    noise = 0.05 ** 2 * torch.ones(1, Nt, Nf)
+    noise = 0.05 ** 2 * torch.ones(2, Nt, Nf, dtype=torch.float64)
+    noise = _flagged_noise(noise, flags)                          # caller down-weights flags
 
     out = inpaint(data, flags, times, freqs, noise=noise, freq_kernel=kf, time_kernel=kt,
                   mode="joint", method="woodbury", fit=False, center=False, rcond=1e-12)
 
-    # reference: a direct Kronecker-Woodbury fill with the same cores / FLAG_VAR
+    # reference: a direct Kronecker-Woodbury fill with the same cores / noise
     P = kt(times[:, None]).to_dense().detach()
     F = kf(freqs[:, None]).to_dense().detach()
-    nz = noise.expand(2, Nt, Nf).clone()
-    nz[flags] = 1e12
-    m = kron_woodbury_predict(P, F, nz, data, rcond=1e-12)
+    m = kron_woodbury_predict(P, F, noise, data, rcond=1e-12)
     ref = torch.where(flags, m, data)
 
     assert out.dtype == torch.cdouble
@@ -305,20 +317,52 @@ def test_inpaint_joint_cg_complex():
     flags = torch.zeros(2, Nt, Nf, dtype=bool)
     flags[:, 4, :] = True
     flags[:, :, 5] = True
-    noise = 0.05 ** 2 * torch.ones(1, Nt, Nf)
+    noise = 0.05 ** 2 * torch.ones(2, Nt, Nf, dtype=torch.float64)
+    noise = _flagged_noise(noise, flags)                          # caller down-weights flags
 
     out = inpaint(data, flags, times, freqs, noise=noise, freq_kernel=kf, time_kernel=kt,
                   mode="joint", method="cg", cg_tol=1e-10, cg_max_iter=2000,
                   fit=False, center=False)
 
-    # reference: a direct preconditioned-CG fill with the same kernels / FLAG_VAR / tol
+    # reference: a direct preconditioned-CG fill with the same kernels / noise / tol
     Ct = kt(times[:, None]).to_dense().detach()
     Cf = kf(freqs[:, None]).to_dense().detach()
-    nz = noise.expand(2, Nt, Nf).clone()
-    nz[flags] = 1e12
-    m, _ = kron_wiener_cg(Ct, Cf, nz, data, tol=1e-10, max_iter=2000)
+    m, _ = kron_wiener_cg(Ct, Cf, noise, data, tol=1e-10, max_iter=2000)
     ref = torch.where(flags, m, data)
 
     assert out.dtype == torch.cdouble
     assert torch.allclose(out[~flags], data[~flags], atol=1e-6)   # good pixels untouched
     assert torch.allclose(out, ref, atol=1e-7)                    # wired to the CG solver
+
+
+def test_axis_inpaint_complex_kernel_ignores_unpack_complex():
+    """A complex covariance couples real & imag, so unpack_complex=True is invalid for the
+    axis (freq/time) modes: it must be ignored (warn + fall back to the direct complex
+    solve) rather than stacking real/imag against a complex covariance, which used to raise
+    a real-vs-complex dtype error. The fallback must match unpack_complex=False."""
+    import warnings
+    torch.manual_seed(0)
+    Nt, Nf = 12, 10
+    times = torch.linspace(0., 100., Nt, dtype=torch.float64)
+    freqs = torch.linspace(120., 180., Nf, dtype=torch.float64)
+    # explicit COMPLEX time kernel (CarrierKernel) -> the time-axis path sees a complex cov
+    kt = kernels.CarrierKernel(kernels.ScaleKernel(kernels.RBFKernel()), tau=0.02).double()
+    kt.base_kernel.base_kernel.lengthscale = 20.0
+
+    data = torch.randn(2, Nt, Nf, dtype=torch.cdouble)
+    flags = torch.zeros(2, Nt, Nf, dtype=bool)
+    flags[:, 4, :] = True            # fully-flagged time integration (filled via time corr)
+    flags[0, 7, 2] = True            # a scattered flag
+    noise = 0.05 ** 2 * torch.ones(2, Nt, Nf, dtype=torch.float64)
+    noise = _flagged_noise(noise, flags)                          # caller down-weights flags
+
+    kw = dict(noise=noise, time_kernel=kt, mode="time", method="woodbury", fit=False)
+    out_direct = inpaint(data, flags, times, freqs, unpack_complex=False, **kw)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        out_unpack = inpaint(data, flags, times, freqs, unpack_complex=True, **kw)
+
+    assert any("unpack_complex=True ignored" in str(x.message) for x in w)   # warned, didn't crash
+    assert out_unpack.dtype == torch.cdouble and torch.isfinite(out_unpack).all()
+    assert torch.allclose(out_unpack, out_direct, atol=1e-10)                # fell back -> same answer
+    assert torch.allclose(out_unpack[~flags], data[~flags], atol=1e-6)       # good pixels untouched
