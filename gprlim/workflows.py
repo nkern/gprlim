@@ -1,13 +1,11 @@
-import numpy as np
 import torch
 import gpytorch
 import warnings
 
-from .models import fixednoise_gp_1d, optimize_kernel, gpr_invert
+from .models import mean_center, fit_kernel, gp_inpaint
 from .kernels import default_freq_kernel, default_time_kernel
-from .solvers import kron_woodbury_predict, kron_wiener_cg
+from .solvers import kron_woodbury_predict, kron_wiener_cg, gpr_invert
 
-from gpytorch.means import ZeroMean
 from linear_operator import to_linear_operator
 from linear_operator.operators import DiagLinearOperator, KroneckerProductLinearOperator
 
@@ -21,83 +19,6 @@ try:
 	from hera_cal.redcal import get_pos_reds
 except:
 	warnings.warn("Couldn't import hera_cal")
-
-
-def hera_freq_inpaint(
-	data,
-	flags,
-	x,
-	dim=-1,
-	y_scale=None
-
-):
-	"""
-	Inpaint flagged pixels along a single axis with a fixed-noise GP (work in progress).
-
-	An earlier single-axis sketch, superseded by :func:`inpaint`; retained for reference
-	and not currently functional (it references quantities it does not define).
-
-	Parameters
-	----------
-	data : tensor
-	    Complex or real data; the axis to inpaint over is ``dim``.
-	flags : tensor
-	    Boolean flags matching ``data`` (True where flagged).
-	x : tensor
-	    Coordinate grid along the inpaint axis, shape (Nx,).
-	dim : int, optional
-	    Axis of ``data`` to inpaint over.
-	y_scale : tensor, optional
-	    Pre-scaling applied to the data before fitting and undone afterward.
-	"""
-	# get data shape
-	shape = data.shape
-	Nx = shape[dim]
-	data = data.moveaxis(dim, -1)  # this is a view
-	flags = flags.moveaxis(dim, -1)
-
-	if y_scale is None:
-		y_scale = torch.tensor(1.0)
-
-	# get flag info
-	all_flags = flags.all(dim=dim, keepdim=True)
-	inp_flags = all_flags ^ flags # where to inpaint
-
-	# setup training targets and samples
-	if data.is_complex():
-		train_y = torch.vstack([data.real.reshape(-1, Nx), data.imag.reshape(-1, Nx)]) / y_scale
-		train_flags = torch.vstack([flags.reshape(-1, Nx), flags.reshape(-1, Nx)])
-		train_inp_flags = torch.vstack([inp_flags.reshape(-1, Nx), inp_flags.reshape(-1, Nx)])
-	else:
-		train_y = data.reshape(-1, Nx) / y_scale
-		train_flags = flags.reshape(-1, Nx)
-		train_inp_flags = inp_flags.reshape(-1, Nx)
-
-	train_x = x[None, :, None]
-
-	# estimate robust signal variance
-	y_med = torch.median(train_y[~train_flags])
-	y_mad = torch.median((train_y[~train_flags] - dmed).abs()) * 1.48  # robust measure
-	y_var = dmad**2
-
-	# subtract off noise variance (1/2 for real/imag)
-	y_var -= sigma_N[~flags].pow(2).median() / 2
-
-	# setup noise weights (variance)
-	noise_wgts = torch.ones_like(data.real) * sigma_N**2 / pvar
-	noise_wgts[flags] = sigma_N.median().pow(2) * 1e8
-
-	noise_wgts[..., 10:20, 85:130] = sigma_N[..., 10:20, 85:130]**2 / pvar * 1
-
-	noise_wgts = torch.vstack([noise_wgts.reshape(-1, Nfreqs), noise_wgts.reshape(-1, Nfreqs)])
-
-	# get GPModel
-	model, y_offset = fixednoise_gp_1d(train_x, train_y, mean, covar, inv_wgts=noise_wgts, center_y=True, Ndeg=1)
-	y_offset = y_offset if y_offset is not None else 0
-
-	# inpaint
-	inp_m = model.inpaint(None, y_offset=y_offset, y_scale=pvar.sqrt(), to_complex=True, return_model=True).reshape(-1, Ntimes, Nfreqs)
-	inp_y = model.inpaint(train_inp_flags, y_offset=y_offset, y_scale=pvar.sqrt(), to_complex=True).reshape(-1, Ntimes, Nfreqs)
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +113,7 @@ def fit_axis_kernel(data, flags, noise, x, kernel, nsamp=512, iters=5,
     iters : int, optional
         Number of optimizer iterations.
     opt : str or torch.optim.Optimizer, optional
-        Optimizer passed to ``optimize_kernel`` (e.g. 'LBFGS', 'Adam').
+        Optimizer passed to ``fit_kernel`` (e.g. 'LBFGS', 'Adam').
     method : str, optional
         Marginal-likelihood solver, 'cholesky' (stable) or 'woodbury'.
 
@@ -216,14 +137,13 @@ def fit_axis_kernel(data, flags, noise, x, kernel, nsamp=512, iters=5,
     else:
         ys, nzs = s, nz
 
-    # fit the hyperparameters IN PLACE by the marginal likelihood
-    model, _ = fixednoise_gp_1d(x[None, :, None], ys, ZeroMean(), kernel, inv_wgts=nzs)
-    optimize_kernel(model, Niter=iters, opt=opt, batched=method)
+    # fit the hyperparameters IN PLACE by the batched marginal likelihood (zero mean)
+    fit_kernel(kernel, x[None, :, None], ys, nzs, Niter=iters, opt=opt, method=method)
 
     return kernel
 
 
-def _axis_inpaint(rows, rflags, iwgts, x, kernel, complex_in, center, Ndeg, method, unpack_complex):
+def _axis_inpaint(rows, rflags, iwgts, x, kernel, complex_in, center, method, unpack_complex):
     """
     Per-row GP inpaint along one axis.
 
@@ -231,8 +151,8 @@ def _axis_inpaint(rows, rflags, iwgts, x, kernel, complex_in, center, Ndeg, meth
     ``kernel`` over the grid ``x``; flagged pixels are filled by the batched Wiener solve.
 
     By default (``unpack_complex=False``) complex rows are solved directly -- a real
-    ``kernel`` covariance is promoted to complex inside :class:`GPModel` (same answer, one
-    complex solve). With ``unpack_complex=True`` the real and imaginary parts are instead
+    ``kernel`` covariance is promoted to complex inside :func:`gprlim.models.posterior_mean`
+    (same answer, one complex solve). With ``unpack_complex=True`` the real and imaginary parts are instead
     stacked into the batch and solved as a real GP (two real solves), then recombined --
     cheaper, and valid because a real covariance acts identically on each part.
 
@@ -252,9 +172,7 @@ def _axis_inpaint(rows, rflags, iwgts, x, kernel, complex_in, center, Ndeg, meth
     complex_in : bool
         Whether ``rows`` is complex.
     center : bool
-        If True, subtract a per-row polynomial baseline before the solve.
-    Ndeg : int
-        Polynomial degree used when ``center`` is True.
+        If True, subtract a per-row inverse-noise-weighted mean before the solve.
     method : str
         Batched solver for the posterior mean, 'cholesky' or 'woodbury'.
     unpack_complex : bool
@@ -266,8 +184,6 @@ def _axis_inpaint(rows, rflags, iwgts, x, kernel, complex_in, center, Ndeg, meth
     -------
     inp : tensor
         Inpainted rows of shape (Nrows, Nx) (flagged pixels filled, good pixels kept).
-    model : GPModel
-        The fixed-noise GP model used for the solve.
     """
     # stacking real/imag for a real GP is valid only for a REAL covariance (it acts
     # identically on each part); a complex covariance couples them, so honor
@@ -283,23 +199,23 @@ def _axis_inpaint(rows, rflags, iwgts, x, kernel, complex_in, center, Ndeg, meth
         train_fl = torch.cat([rflags, rflags], 0)
         train_iw = torch.cat([iwgts, iwgts], 0)
     else:
-        # solve the data directly (GPModel promotes a real covariance to complex for
-        # complex rows -- one complex solve, same result)
+        # solve the data directly (posterior_mean promotes a real covariance to complex
+        # for complex rows -- one complex solve, same result)
         train_y, train_fl, train_iw = rows, rflags, iwgts
 
-    # batched Wiener fill K (K + diag(noise))^-1 y per row; replaces flagged pixels
-    model, y_off = fixednoise_gp_1d(x[None, :, None], train_y, ZeroMean(), kernel,
-                                    inv_wgts=train_iw, center_y=center, Ndeg=Ndeg)
-    inp, _ = model.inpaint(train_fl, y_offset=y_off, unpack_complex=unpack, method=method)
-
-    return inp, model
+    # optional per-row weighted-mean centering, then batched Wiener fill per row
+    y_off = mean_center(train_y, train_iw) if center else None
+    yc = train_y - y_off if y_off is not None else train_y
+    inp, _ = gp_inpaint(kernel, x[None, :, None], yc, train_iw, train_fl,
+                        y_offset=y_off, unpack_complex=unpack, method=method)
+    return inp
 
 
 def inpaint(data, flags, times, freqs, noise, freq_kernel=None, time_kernel=None,
             bl_vecs=None, latitude=None,
-            fit=True, mode='freq', center=True, Ndeg=1, fit_nsamp=512, fit_iter=50,
-            fit_opt='LBFGS', method='woodbury', cg_tol=1e-8, cg_max_iter=1000, rcond=1e-12,
-            unpack_complex=False, return_model=False):
+            fit=True, mode='freq', center=True, fit_nsamp=512, fit_iter=50,
+            fit_opt='LBFGS', method='woodbury', cg_tol=1e-8, cg_max_iter=1000, n_jobs=1,
+            rcond=1e-12, eta=None, unpack_complex=False, return_model=False):
     """
     GP-inpaint complex visibility data over flagged pixels.
 
@@ -347,9 +263,8 @@ def inpaint(data, flags, times, freqs, noise, freq_kernel=None, time_kernel=None
     mode : {'freq', 'time', 'joint'}, optional
         Which inpaint to run (see Notes).
     center : bool, optional
-        Subtract a per-row polynomial baseline before the 'freq'/'time' GP solve.
-    Ndeg : int, optional
-        Polynomial degree used when ``center`` is True.
+        Subtract a per-row inverse-noise-weighted mean before the 'freq'/'time' GP solve
+        (for richer trends, supply a kernel with a real mean function instead).
     fit_nsamp : int, optional
         Maximum number of rows used to fit each kernel.
     fit_iter : int, optional
@@ -358,18 +273,33 @@ def inpaint(data, flags, times, freqs, noise, freq_kernel=None, time_kernel=None
         Optimizer for the kernel fit (e.g. 'LBFGS', 'Adam').
     method : str, optional
         Posterior-mean solver. For 'freq'/'time' modes: the batched 'cholesky' or
-        'woodbury' solver. For 'joint' mode on a complex covariance, also selects the
-        no-densify solver: 'woodbury' (default; direct, rank-truncated at ``rcond``),
-        'cg' (preconditioned complex CG, no truncation, accurate to ``cg_tol``), or
-        'cholesky' (densifies the full ``(Ntimes*Nfreqs)^2`` covariance -- exact, but
-        only when it fits in memory).
+        'woodbury' solver. For 'joint' mode (real or complex covariance) selects the
+        no-densify structured solver: 'woodbury' (default; direct, rank-truncated at
+        ``rcond``), 'cg' (preconditioned CG, no truncation, accurate to ``cg_tol``,
+        parallelized over baselines by ``n_jobs``), or 'cholesky' (a complex covariance is
+        densified -- exact, memory permitting; a real covariance uses the structured
+        linear_operator solve). 'woodbury' and 'cg' batch all baselines in one solve.
     cg_tol : float, optional
         CG tolerance. Used by the joint 'cg' solver, and by the 'joint' structured real
         solve when ``Ntimes * Nfreqs > max_cholesky_size``.
     cg_max_iter : int, optional
         Maximum iterations for the joint 'cg' solver (raise for high-dynamic-range cases).
+    n_jobs : int, optional
+        Threads for the joint 'cg' solver, parallelizing the per-baseline CG over the
+        baseline axis (the preconditioner is shared; each batched matvec only lightly
+        threads on its own, so this is where the cores come from for multi-baseline data).
+        1 = serial (default), k = k threads, -1 = one per CPU. 'cg' mode only.
     rcond : float, optional
         Low-rank eigenvalue cutoff for the joint-mode 'woodbury' solver.
+    eta : float, optional
+        Joint-mode time-decorrelation shrinkage in [0, 1] (default 0). Before the solve,
+        the time kernel is blended toward its diagonal,
+        ``Ct <- (1 - eta) * Ct + eta * diag(Ct)`` -- a variance-preserving shrinkage that
+        caps the dominant time mode so the frequency kernel sets the delay cutoff, reducing
+        spectral leakage to high delay (the science-critical regime) for narrowband flags.
+        ``eta=0`` is the full Kronecker joint; ``eta=1`` decouples the solve into
+        independent per-time frequency inpaints (maximal delay confinement). Ignored
+        outside 'joint' mode.
     unpack_complex : bool, optional
         How complex data is handled. If False (default) operate on the complex data
         directly -- a real covariance is promoted to complex (imag = 0) and the complex
@@ -397,10 +327,11 @@ def inpaint(data, flags, times, freqs, noise, freq_kernel=None, time_kernel=None
       (baseline, frequency); fills fully-flagged time integrations (which a per-time
       'freq' pass cannot) via time correlation.
     - ``'joint'`` : full 2-D inpaint with the separable Kronecker covariance
-      ``K = Ct (x) Cf``, using the structured (never densified) operator. Solved per
-      baseline, or -- when flags and noise are shared (passed as (1, Ntimes, Nfreqs)) -- for all
-      baselines at once as columns of one batched solve (no per-baseline loop). For the
-      frequency-evolving carrier, replace ``Ct (x) Cf`` with a sum over ``Ct_m (x) Cf_m``.
+      ``K = Ct (x) Cf``, using the structured (never densified) operator. The 'woodbury'
+      and 'cg' solvers batch all baselines in one solve -- a complex covariance solved
+      directly, a real one split into [real, imag] -- with no per-baseline loop; 'cg'
+      parallelizes over baselines via ``n_jobs``. For the frequency-evolving carrier,
+      replace ``Ct (x) Cf`` with a sum over ``Ct_m (x) Cf_m``.
     """
     # ---- normalize everything to (Nbls, Ntimes, Nfreqs) ----
     data = torch.as_tensor(data)
@@ -447,11 +378,11 @@ def inpaint(data, flags, times, freqs, noise, freq_kernel=None, time_kernel=None
             fit_axis_kernel(rows, rflags, iwgts, freqs, freq_kernel,
                             nsamp=fit_nsamp, iters=fit_iter, opt=fit_opt)
 
-        inp, model = _axis_inpaint(rows, rflags, iwgts, freqs, freq_kernel,
-                                   data.is_complex(), center, Ndeg, method, unpack_complex)
+        inp = _axis_inpaint(rows, rflags, iwgts, freqs, freq_kernel,
+                            data.is_complex(), center, method, unpack_complex)
         out = inp.reshape(d3.shape)                         # back to (Nbls, Ntimes, Nfreqs)
         out = out[0] if twod else out                      # drop baseline axis for 2-D input
-        return (out, dict(freq_kernel=freq_kernel, model=model)) if return_model else out
+        return (out, dict(freq_kernel=freq_kernel)) if return_model else out
 
     elif mode == 'time':
         # rows = per-(baseline, channel) time series sharing the time kernel; fills
@@ -465,11 +396,11 @@ def inpaint(data, flags, times, freqs, noise, freq_kernel=None, time_kernel=None
             fit_axis_kernel(rows, rflags, iwgts, times, time_kernel,
                             nsamp=fit_nsamp, iters=fit_iter, opt=fit_opt)
 
-        inp, model = _axis_inpaint(rows, rflags, iwgts, times, time_kernel,
-                                   data.is_complex(), center, Ndeg, method, unpack_complex)
+        inp = _axis_inpaint(rows, rflags, iwgts, times, time_kernel,
+                            data.is_complex(), center, method, unpack_complex)
         out = inp.reshape(Nbls, Nfreqs, Ntimes).permute(0, 2, 1)   # (Nbls, Nfreqs, Ntimes) -> (Nbls, Ntimes, Nfreqs)
         out = out[0] if twod else out
-        return (out, dict(time_kernel=time_kernel, model=model)) if return_model else out
+        return (out, dict(time_kernel=time_kernel)) if return_model else out
 
     elif mode == 'joint':
         # fit both shared kernels: freq on the spectra, time on the transposed series
@@ -485,6 +416,13 @@ def inpaint(data, flags, times, freqs, noise, freq_kernel=None, time_kernel=None
         # common dtype; unless unpack_complex, also promote a real covariance to complex for
         # complex data (-> complex solve below; else the real path splits real/imag).
         Ct = time_kernel(times[:, None]).to_dense().detach()
+        if eta:
+            # shrink Ct toward its diagonal (decorrelate time): caps the dominant time mode
+            # so Cf sets the delay cutoff -> less spectral leakage to high delay. eta=1
+            # decouples into per-time freq solves. Variance-preserving (diagonal unchanged).
+            if not 0.0 <= eta <= 1.0:
+                raise ValueError(f"eta must be in [0, 1], got {eta}")
+            Ct = (1.0 - eta) * Ct + eta * torch.diag(Ct.diagonal())
         Cf = freq_kernel(freqs[:, None]).to_dense().detach()
         cov_dtype = torch.promote_types(Ct.dtype, Cf.dtype)
         if data.is_complex() and not unpack_complex:
@@ -502,28 +440,45 @@ def inpaint(data, flags, times, freqs, noise, freq_kernel=None, time_kernel=None
                 if method == 'woodbury':
                     m = kron_woodbury_predict(Ct, Cf, n3, d3, rcond=rcond)
                 elif method == 'cg':
-                    m, _ = kron_wiener_cg(Ct, Cf, n3, d3, tol=cg_tol, max_iter=cg_max_iter)
+                    m, _ = kron_wiener_cg(Ct, Cf, n3, d3, tol=cg_tol, max_iter=cg_max_iter,
+                                          n_jobs=n_jobs)
                 else:
                     Cs = Ks.to_dense()
                     m = gpr_invert(Cs, n3.reshape(Nbls, -1), B=Cs,
                                    y=d3.reshape(Nbls, -1), method='cholesky').reshape(Nbls, Ntimes, Nfreqs)
                 out = torch.where(f3, m.to(d3.dtype), d3)
             else:
-                # real covariance, structured solve (never densified; CG for large sizes).
-                # Reached for real data, or complex data with unpack_complex=True -- which
-                # splits real/imag into independent solves.
+                # real covariance: it acts identically on the real & imag parts, so split a
+                # complex datum into [real, imag] stacked on the batch axis (twice the RHS but
+                # real arithmetic, ~2x cheaper than one complex solve) and solve together.
                 parts = (lambda z: z.real, lambda z: z.imag) if data.is_complex() else (lambda z: z,)
-                if shared:
-                    A = Ks + DiagLinearOperator(n3[0].reshape(-1))   # one operator for all baselines
-                    # columns = parts of every baseline, part-major so the reshape recovers them
-                    rhs = torch.cat([p(d3) for p in parts], 0).reshape(len(parts) * Nbls, -1).transpose(0, 1)
-                    m = Ks.matmul(A.solve(rhs)).transpose(0, 1).reshape(len(parts), Nbls, Ntimes, Nfreqs)
+                P = len(parts)
+                if method in ('cg', 'woodbury'):
+                    # the kron solvers batch over all (part, baseline) RHS -- no per-baseline
+                    # loop; per-baseline noise is just a batched diagonal, and 'cg' is n_jobs-parallel.
+                    ys = torch.cat([p(d3) for p in parts], 0)            # (P*Nbls, Ntimes, Nfreqs)
+                    nz = torch.cat([n3] * P, 0)                          # matching per-RHS noise
+                    if method == 'cg':
+                        mm, _ = kron_wiener_cg(Ct, Cf, nz, ys, tol=cg_tol,
+                                               max_iter=cg_max_iter, n_jobs=n_jobs)
+                    else:
+                        mm = kron_woodbury_predict(Ct, Cf, nz, ys, rcond=rcond)
+                    mm = mm.reshape(P, Nbls, Ntimes, Nfreqs)
+                    fill = torch.complex(mm[0], mm[1]) if data.is_complex() else mm[0]
+                    out = torch.where(f3, fill.to(d3.dtype), d3)
+                elif shared:
+                    # 'cholesky': densify-free linear_operator solve (CG for large sizes), one
+                    # operator for all baselines (shared noise) -> a single batched solve.
+                    A = Ks + DiagLinearOperator(n3[0].reshape(-1))
+                    rhs = torch.cat([p(d3) for p in parts], 0).reshape(P * Nbls, -1).transpose(0, 1)
+                    m = Ks.matmul(A.solve(rhs)).transpose(0, 1).reshape(P, Nbls, Ntimes, Nfreqs)
                     fill = torch.complex(m[0], m[1]) if data.is_complex() else m[0]
                     out = torch.where(f3, fill.to(d3.dtype), d3)
                 else:
+                    # 'cholesky' with per-baseline noise: structured per-baseline solve (rare)
                     out = d3.clone()
                     for bl in range(Nbls):
-                        A = Ks + DiagLinearOperator(n3[bl].reshape(-1))  # this baseline's added diagonal
+                        A = Ks + DiagLinearOperator(n3[bl].reshape(-1))
                         filled = [Ks.matmul(A.solve(p(d3[bl]).reshape(-1, 1))).reshape(Ntimes, Nfreqs)
                                   for p in parts]
                         fillbl = torch.complex(filled[0], filled[1]) if data.is_complex() else filled[0]

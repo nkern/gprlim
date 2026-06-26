@@ -1,12 +1,14 @@
 """
-Linear solvers for structured Gaussian-process inference: a complex, preconditioned
-conjugate-gradient solver and batched Kronecker(-Woodbury / -Cholesky) routines.
+Linear solvers for Gaussian-process inference: a complex preconditioned conjugate-gradient
+solver, batched Kronecker(-Woodbury / -Cholesky) routines, and the general batched dense
+Wiener solvers.
 
 Throughout, ``Ct`` is the time-axis kernel (an ``(Ntimes, Ntimes)`` Hermitian covariance,
 possibly complex) and ``Cf`` is the frequency-axis kernel (``(Nfreqs, Nfreqs)``), and the
 joint signal covariance is the Kronecker product ``Ct (x) Cf``.
 
-These all avoid densifying the unraveled ``(Ntimes*Nfreqs) x (Ntimes*Nfreqs)`` covariance:
+The structured Kronecker routines never densify the unraveled
+``(Ntimes*Nfreqs) x (Ntimes*Nfreqs)`` covariance:
 
 * :func:`pcg` -- preconditioned CG for Hermitian PD systems, real or complex, through a
   matmul-only interface, with pluggable dense / structured preconditioners
@@ -20,7 +22,17 @@ These all avoid densifying the unraveled ``(Ntimes*Nfreqs) x (Ntimes*Nfreqs)`` c
   low rank).
 * :func:`kron_cholesky` -- the implicit Cholesky factor of a Kronecker product (used by
   :class:`gprlim.kernels.KroneckerKernel` for prior draws / whitening).
+
+The batched dense solvers instead take a single (Nsamples x Nsamples) signal covariance
+``C`` shared across a batch of per-row noise diagonals -- the per-axis ('freq'/'time'-mode)
+workhorse, and the dense dual of the Kronecker routines above:
+
+* :func:`gpr_invert` (dispatching to :func:`woodbury_batched` / :func:`cholesky_batched`,
+  with :func:`gp_predict` the Wiener-mean wrapper) -- ``B (C + diag(N_b))^-1 y_b`` per row.
 """
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import torch
 from linear_operator import to_linear_operator
 from linear_operator.operators import (
@@ -211,7 +223,7 @@ def kron_matvec(Ct, Cf, diag=None):
     return mv
 
 
-def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=None):
+def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=None, n_jobs=1):
     r"""
     Complex Wiener posterior mean  ``m = (Ct (x) Cf) (Ct (x) Cf + diag(noise))^-1 y``  via
     preconditioned CG: structured throughout (never densifies the ``(Ntimes*Nfreqs)^2``
@@ -225,7 +237,7 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
         PSD (``Ct`` may be complex).
     noise : tensor
         Per-pixel noise variance, shape (..., Ntimes, Nfreqs); flagged pixels carry a
-        large value.
+        large value. A leading axis of 1 (shared across the batch) broadcasts.
     y : tensor
         Data, shape (..., Ntimes, Nfreqs).
     shift : float, optional
@@ -233,13 +245,20 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
         variance), which makes the preconditioner capture the bulk of ``A``.
     tol, max_iter, x0
         Forwarded to :func:`pcg`.
+    n_jobs : int, optional
+        Threads used to parallelize the CG over the leading (batch / baseline) axis. The
+        per-axis eigendecompositions and the preconditioner are built once and shared; only
+        the independent right-hand sides are split across threads (PyTorch releases the GIL
+        during the BLAS matvecs). Each batched matvec only lightly threads on its own, so on
+        many baselines this is where the cores come from. 1 = serial (default), k = k
+        threads, -1 = one per CPU. Capped at the batch size.
 
     Returns
     -------
     m : tensor
         Posterior mean, shape (..., Ntimes, Nfreqs).
     info : dict
-        CG diagnostics from :func:`pcg`.
+        CG diagnostics; for a parallel run, the worst (max) ``iters`` / ``resid`` over chunks.
     """
     # unravel the (Ntimes, Nfreqs) grids to length-(Ntimes*Nfreqs) vectors (time slow, freq fast)
     Ntimes, Nfreqs = Ct.shape[-1], Cf.shape[-1]
@@ -247,18 +266,35 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
     y_f = y.reshape(*y.shape[:-2], Ntimes * Nfreqs)
 
     # shift = good-pixel noise variance, so the preconditioner M = Ct (x) Cf + sigma^2 I
-    # matches A on the (bulk) unflagged pixels -> CG only has to resolve the flagged ones
+    # matches A on the (bulk) unflagged pixels -> CG only has to resolve the flagged ones.
+    # Built ONCE (one eigh per axis) and shared across all baselines / threads.
     if shift is None:
         shift = float(noise_f.real.amin())
-
-    # solve alpha = (Ct (x) Cf + diag(noise))^-1 y by preconditioned CG, with A applied as a
-    # structured matvec (the full covariance is never densified) ...
-    A = kron_matvec(Ct, Cf, diag=noise_f)
     M = kron_eigen_preconditioner(Ct, Cf, shift=shift)
-    alpha, info = pcg(A, y_f, M=M, tol=tol, max_iter=max_iter, x0=x0)
 
-    # ... then the Wiener posterior mean is m = (Ct (x) Cf) alpha (one more Kron matvec)
-    m = kron_matvec(Ct, Cf)(alpha)
+    def solve(yf, nf, xf):
+        # alpha = (Ct (x) Cf + diag(noise))^-1 yf via preconditioned CG (A never densified),
+        # then the Wiener mean m = (Ct (x) Cf) alpha (one more structured matvec)
+        a, inf = pcg(kron_matvec(Ct, Cf, diag=nf), yf, M=M, tol=tol, max_iter=max_iter, x0=xf)
+        return kron_matvec(Ct, Cf)(a), inf
+
+    # number of independent right-hand sides (e.g. baselines) on the leading axis
+    B = y_f.shape[0] if y_f.dim() > 1 else 1
+    nw = min(B, (os.cpu_count() or 1) if n_jobs in (-1, None) else max(1, n_jobs))
+    if nw <= 1:
+        m, info = solve(y_f, noise_f, x0)
+    else:
+        # split the batch into nw chunks; M is shared, the matvec's noise diagonal is sliced
+        # per chunk (or shared when noise has a leading axis of 1). GIL is released in the BLAS.
+        per_bl_noise = noise_f.shape[0] == B
+        def work(c):
+            return solve(y_f[c], noise_f[c] if per_bl_noise else noise_f,
+                         x0[c] if x0 is not None else None)
+        with ThreadPoolExecutor(nw) as ex:
+            parts = list(ex.map(work, torch.arange(B).chunk(nw)))
+        m = torch.cat([p[0] for p in parts], 0)
+        info = {'iters': max(p[1]['iters'] for p in parts),
+                'resid': max(p[1]['resid'] for p in parts)}
     return m.reshape(y.shape), info
 
 
@@ -443,3 +479,261 @@ def kron_cholesky(mats, jitter=1e-10):
             m = m + eps * torch.eye(n, dtype=m.dtype, device=m.device)
         chols.append(TriangularLinearOperator(torch.linalg.cholesky(m), upper=False))
     return KroneckerProductTriangularLinearOperator(*chols)
+
+
+# --------------------------------------------------------------------------------------
+# batched dense (C + diag(N))^-1 solvers  (shared C, per-row noise diagonal)
+# --------------------------------------------------------------------------------------
+def _eigh_solve(A, rhs, rcond):
+    """
+    Truncated-eigendecomposition solve A^+ @ rhs for a batch of Hermitian A,
+    robust to singular / indefinite A (the pinv-equivalent fallback). Modes
+    with eigenvalue <= rcond * lambda_max are dropped.
+
+    Parameters
+    ----------
+    A : tensor
+        Hermitian matrices of shape (..., n, n)
+    rhs : tensor
+        Right-hand sides of shape (..., n, c)
+    rcond : float
+        Relative eigenvalue cutoff.
+
+    Returns
+    -------
+    tensor of shape (..., n, c)
+    """
+    w, V = torch.linalg.eigh(A)
+    winv = torch.where(w > rcond * w[..., -1:].clamp_min(0), 1.0 / w, torch.zeros_like(w))
+    return V @ (winv.unsqueeze(-1) * (V.transpose(-1, -2) @ rhs))
+
+
+def woodbury_batched(C, N, B=None, y=None, rcond=1e-15):
+    """
+    Batched Woodbury solve of (C + diag(N_b))^-1 over a batch of noise
+    diagonals N sharing a single low-rank covariance C. Fast when the
+    effective rank k = rank(C) (modes above rcond) is < n. Requires N > 0
+    (it uses 1/N); for possibly singular / indefinite systems use
+    `cholesky_batched`.
+
+    Computes, per batch element, B @ (C + diag(N_b))^-1 @ y_b with B and/or y
+    optional (see `gpr_invert`). The y-path never forms the (n, n) inverse.
+
+    Parameters
+    ----------
+    C : tensor
+        Shared signal covariance (n, n), PSD.
+    N : tensor
+        Per-batch noise variance diagonal (Nbatch, n), > 0.
+    B : tensor, optional
+        Left matrix (N*, n), e.g. cross-covariance K(x*, X).
+    y : tensor, optional
+        Observations (Nbatch, n).
+    rcond : float
+        Relative eigenvalue cutoff for the rank of C.
+
+    Returns
+    -------
+    tensor
+    """
+    # low-rank factor of the signal covariance, keeping the modes above the
+    # rcond cutoff: C ~= U U^H, with k = effective rank (U is complex if C is)
+    evals, evecs = torch.linalg.eigh(C)
+    keep = evals > evals[-1] * rcond
+    U = evecs[:, keep] * evals[keep].clamp_min(0).sqrt()  # (n, k)
+
+    # noise precision diagonal (Woodbury requires N > 0); Nc carries U's dtype so
+    # the matmul-backed einsums don't mix real & complex (a no-op when C is real)
+    Ninv = 1.0 / N  # (b, n)
+    Nc = Ninv.to(U.dtype)
+
+    # capacitance matrix M_b = I_k + U^H diag(1/N_b) U, and its Cholesky
+    M = torch.einsum('nk,bn,nl->bkl', U.conj(), Nc, U)  # (b, k, k)
+    M.diagonal(dim1=-2, dim2=-1).add_(1.0)
+    L = torch.linalg.cholesky(M)
+
+    # y-path: apply (C + diag(N_b))^-1 to y_b via the Woodbury identity,
+    # without ever forming the (n, n) inverse
+    if y is not None:
+
+        # whiten y by the noise, then project into the low-rank subspace
+        Dy = Ninv * y  # (b, n)
+        rhs = torch.einsum('nk,bn->bk', U.conj(), Dy).unsqueeze(-1)
+
+        # solve the small (k, k) capacitance system
+        z = torch.cholesky_solve(rhs, L).squeeze(-1)  # (b, k)
+
+        # reconstruct alpha_b = (C + diag(N_b))^-1 y_b
+        alpha = Dy - Ninv * torch.einsum('nk,bk->bn', U, z)  # (b, n)
+
+        # optionally pre-multiply by B (e.g. the cross-covariance K(x*, X))
+        return alpha if B is None else torch.einsum('mn,bn->bm', B, alpha)
+
+    # no-y path: build the full inverse per batch element via
+    # (D + U U^H)^-1 = Dinv - Dinv U M^-1 U^H Dinv
+    b = N.shape[0]
+    MiUt = torch.cholesky_solve(U.conj().t().expand(b, -1, -1).contiguous(), L)  # (b, k, n) = M^-1 U^H
+    W = torch.einsum('nk,bkm->bnm', U, MiUt)  # (b, n, n) = U M^-1 U^H
+    inv = torch.diag_embed(Nc) - Ninv.unsqueeze(-1) * W * Ninv.unsqueeze(-2)
+
+    # optionally pre-multiply by B
+    return inv if B is None else torch.einsum('rp,bpq->brq', B, inv)
+
+
+def cholesky_batched(C, N, B=None, y=None, rcond=1e-15):
+    """
+    Batched Cholesky solve of (C + diag(N_b))^-1 over a batch of noise
+    diagonals N sharing a covariance C. General-purpose default: no low-rank
+    assumption on C, and robust to a non-PSD (C + diag(N_b)) -- any batch
+    element that is not positive-definite falls back to a truncated
+    eigendecomposition (pinv-equivalent), so no jitter is needed.
+
+    Same input / output contract as `woodbury_batched`.
+
+    Parameters
+    ----------
+    C : tensor
+        Shared signal covariance (n, n).
+    N : tensor
+        Per-batch noise variance diagonal (Nbatch, n).
+    B : tensor, optional
+        Left matrix (N*, n), e.g. cross-covariance K(x*, X).
+    y : tensor, optional
+        Observations (Nbatch, n).
+    rcond : float
+        Relative eigenvalue cutoff for the non-PD fallback.
+
+    Returns
+    -------
+    tensor
+    """
+    n = C.shape[-1]
+
+    # build the batched system A_b = C + diag(N_b) and attempt a Cholesky;
+    # cholesky_ex flags (info > 0) any element that is not positive-definite
+    A = C.unsqueeze(0) + torch.diag_embed(N)  # (b, n, n)
+    L, info = torch.linalg.cholesky_ex(A)
+    bad = info > 0
+    good = ~bad
+
+    # solve A_b X_b = rhs_b: Cholesky for the PD elements, with a truncated
+    # eigendecomposition (pinv-equivalent) fallback for any non-PD ones
+    def _solve(rhs):  # rhs: (b, n, c)
+        sol = torch.empty_like(rhs)
+        if good.any():
+            sol[good] = torch.cholesky_solve(rhs[good], L[good])
+        if bad.any():
+            sol[bad] = _eigh_solve(A[bad], rhs[bad], rcond)
+        return sol
+
+    # y-path: solve against y_b directly, optionally pre-multiply by B
+    if y is not None:
+        alpha = _solve(y.unsqueeze(-1)).squeeze(-1)  # (b, n)
+        return alpha if B is None else torch.einsum('mn,bn->bm', B, alpha)
+
+    # no-y path: solve against the identity to get the full inverse per batch
+    eye = torch.eye(n, dtype=C.dtype, device=C.device).expand(N.shape[0], n, n)
+    inv = _solve(eye)  # (b, n, n)
+
+    # optionally pre-multiply by B
+    return inv if B is None else torch.einsum('rp,bpq->brq', B, inv)
+
+
+def gpr_invert(C, N, B=None, y=None, rcond=1e-15, method='cholesky', chunk=None):
+    """
+    Perform (C + N)^-1 where C is low-rank
+    and N is diagonal using Woodbury identity.
+    Optionally, compute the matrix product
+    B @ (C + N)^-1 @ y, if B and/or y is provided.
+
+    Parameters
+    ----------
+    C : tensor
+        Covariance matrix of signal (Nsamples, Nsamples)
+    N : tensor
+        Diagonal of noise variance ([Nbatch], Nsamples)
+    B : tensor
+        Matrix to dot into output (N*, Nsamples)
+    y : tensor
+        Observations of shape ([Nbatch], Nsamples)
+    rcond : float
+        Relative condition / eigenvalue cutoff.
+    method : str
+        Batched solver for the shared-C, batched-N case: 'cholesky'
+        (default, robust, no low-rank assumption) or 'woodbury'
+        (faster when rank(C) < Nsamples; requires N > 0).
+    chunk : int, optional
+        Process the batch in chunks of this size to bound memory.
+
+    Returns
+    -------
+    tensor
+    """
+    if N.ndim == 1:
+        # single system: pinv (robust to non-PSD)
+        out = torch.linalg.pinv(C + N.diag(), hermitian=True, rcond=rcond)
+        if y is not None:
+            out = out @ y
+        if B is not None:
+            out = B @ out
+
+    else:
+        assert y is None or y.ndim > 1, "If N has batch dim then y must too"
+        if C.ndim > 2:
+            # C also has a batch dimension (not standard): per-batch pinv
+            assert B is None or B.ndim > 2, "If C has batch dim then B must too"
+            out = torch.stack([
+                gpr_invert(C[i], N[i], B=None if B is None else B[i],
+                           y=None if y is None else y[i], rcond=rcond)
+                for i in range(len(N))
+            ])
+
+        else:
+            # C shared, N batched: vectorized solve (the main driver)
+            solver = {'woodbury': woodbury_batched, 'cholesky': cholesky_batched}[method]
+            if chunk is None:
+                out = solver(C, N, B=B, y=y, rcond=rcond)
+            else:
+                out = torch.cat([
+                    solver(C, N[i:i + chunk], B=B,
+                           y=None if y is None else y[i:i + chunk], rcond=rcond)
+                    for i in range(0, len(N), chunk)
+                ], dim=0)
+
+    return out
+
+
+def gp_predict(Cs, Cn, train_y, Cp=None, rcond=1e-15, method='cholesky', chunk=None):
+    """
+    Compute MAP estimate of signal
+        Cp (Cs + Cn)^-1 y
+
+    Parameters
+    ----------
+    Cs : tensor
+        Covariance matrix of signal (Nsamples, Nsamples)
+    Cn : tensor
+        Variance diagonal of noise ([Nbatch], Nsamples)
+    train_y : tensor
+        Training data ([Nbatch], Nsamples)
+    Cp : tensor
+        Covariance of training points and prediction points.
+        Default is Cs, but can also predict at new points
+        not in training vector (Npredict, Nsamples)
+    rcond : float
+        Relative condition / eigenvalue cutoff.
+    method : str
+        Batched solver, 'cholesky' (default) or 'woodbury'. See `gpr_invert`.
+    chunk : int, optional
+        Process the batch in chunks of this size to bound memory.
+
+    Returns
+    -------
+    Tensor
+    """
+    if Cp is None:
+        Cp = Cs
+
+    # get prediction for all training samples
+    return gpr_invert(Cs, Cn, B=Cp, y=train_y, rcond=rcond, method=method, chunk=chunk)
+

@@ -677,7 +677,7 @@ class CarrierKernel(Kernel):
     fringe-rate PSD requires. ``tau = 0`` recovers the real base kernel.
 
     The output is complex, so use it with the complex-capable solvers (``gpr_invert`` /
-    ``batched_log_prob`` / ``optimize_kernel(batched=...)``), not gpytorch's real-only
+    ``batched_log_prob`` / ``fit_kernel(method=...)``), not gpytorch's real-only
     ``ExactMarginalLogLikelihood``. Fitting works through PyTorch's Wirtinger autograd:
     the real hyperparameters flow through the complex covariance to the real marginal
     likelihood with correct gradients.
@@ -1410,6 +1410,160 @@ def default_freq_kernel(bl_vec, buffer=None, min_delay=50.0, only_amp=True, twin
     k.outputscale = 1e2
 
     return k
+
+
+def multi_kernel_mixture(
+    mean_fix_constant=False,
+    mean_set_constant=None,
+    mean_batch_constant=False,
+    mean_prior_constant=None,
+    mean_bound_constant=None,
+    Nbatch=0,
+    nonstn_scale=False,
+    nonstn_fix=False,
+    nonstn_set=None,
+    nonstn_prior=None,
+    nonstn_bound=None,
+    train_x=None,
+    kern0='sinc',
+    **kwgs,
+    ):
+    """
+    Setup the nested covariance kernel mixture:
+
+    covar = ScaleKernel( SincKernel + ScaleKernel( SincKernel() + ... ) )
+
+    where kern0 is the innermost SincKernel, and kernM is the outermost
+    of M+1 sinc mixtures. Here we use SincKernel as a placeholder, but
+    SincKernel or RBFKernel can be used. To add arbitrary number of covariance
+    kernels, pass the notation kernM_xyz in the kwargs. Use mean_xyz as a template.
+    Note that each sinc has a lengthscale and outputscale as parameters,
+    each of which take fix, set, batch, and prior, options.
+
+    Parameters
+    ----------
+    mean_fix_constant : bool
+        Fix the mean function constant, making it not learnable
+    mean_set_constant : float
+        Set the initial value of the mean constant.
+    mean_batch_constant : bool
+        If True, create Nbatch mean constants for each batch element.
+    mean_prior_constant : Prior object
+        Set the prior for the mean constant hyperparameter.
+    mean_bound_constant : Interval object
+        Set constraints on the mean constant hyperparameter.
+    nonstn_scale : bool
+        If True, multiply a NonStationaryScale kernel at the end of
+        the covariance mixture.
+    nonstn_fix : bool
+        If True, fix the non-stationary coefficient
+    nonstn_set : float
+        Set the value of the non-stationary coefficient
+    nonstn_prior : Prior object
+        Prior for nonstationary scale parameter.
+    nonstn_bound : Internval object
+        Bounds for nonstationary scale parameter.
+    train_x : tensor
+        Needed for NonStationaryScaleKernel instantiation
+    kern0 : str
+        If passed, create a kern0 object, with the following
+        optional parameters. Options are ['sinc', 'rbf'].
+        Defaults are the same as mean_constant defaults.
+        To create more nested kernels, pass kern1='sinc', etc
+    kern0_fix_lengthscale : bool
+    kern0_fix_outputscale : bool
+    kern0_set_lengthscale : float
+    kern0_set_outputscale : float
+    kern0_batch_lengthscale : bool
+    kern0_batch_outputscale : bool
+    kern0_prior_lengthscale : Prior
+    kern0_prior_outputscale : Prior
+    kern0_bound_lengthscale : Interval
+    kern0_bound_outputscale : Interval
+
+    Returns
+    -------
+    mean : gpytorch.means.Mean
+        The constant mean function.
+    covar : gpytorch.kernels.Kernel
+        The nested covariance kernel mixture.
+    """
+    kernels = {'sinc': SincKernel, 'rbf': RBFKernel}
+    # setup constant mean function
+    mean = ConstantMean(
+        batch_shape=torch.Size([Nbatch]) if mean_batch_constant else torch.Size([])
+    )
+    if mean_bound_constant is not None:
+        mean.register_constraint('raw_constant', mean_bound_constant)
+    if mean_fix_constant:
+        mean.constant.requires_grad = False
+    if mean_set_constant is not None:
+        mean.constant = mean_set_constant
+    if mean_prior_constant is not None:
+        mean.register_prior('constant_prior', mean_prior_constant, 'constant')
+
+    i = 0
+    while True:
+        if i > 0 and not kwgs.get(f'kern{i}', False):
+            break
+
+        lengthscale_batch = torch.Size([Nbatch]) if kwgs.get(f'kern{i}_batch_lengthscale') else None
+        outputscale_batch = torch.Size([Nbatch]) if kwgs.get(f'kern{i}_batch_outputscale') else None
+
+        if i == 0:
+            kernel = kernels[kern0.lower()]
+            covar = ScaleKernel(kernel(batch_shape=lengthscale_batch), batch_shape=outputscale_batch)
+            kern = covar.base_kernel
+        else:
+            kernel = kernels[kwgs.get(f'kern{i}').lower()]
+            covar = ScaleKernel(kernel(batch_shape=lengthscale_batch) + covar, batch_shape=outputscale_batch)
+            kern = covar.base_kernel.kernels[0]
+        if kwgs.get(f'kern{i}_bound_outputscale') is not None:
+            covar.register_constraint('raw_outputscale', kwgs.get(f'kern{i}_bound_outputscale'))
+        if kwgs.get(f'kern{i}_bound_lengthscale') is not None:
+            kern.register_constraint('raw_lengthscale', kwgs.get(f'kern{i}_bound_lengthscale'))
+        if kwgs.get(f'kern{i}_fix_lengthscale'):
+            kern.raw_lengthscale.requires_grad = False
+        if kwgs.get(f'kern{i}_fix_outputscale'):
+            covar.raw_outputscale.requires_grad = False
+        if kwgs.get(f'kern{i}_set_lengthscale') is not None:
+            kern.lengthscale = kwgs.get(f'kern{i}_set_lengthscale')
+        if kwgs.get(f'kern{i}_set_outputscale') is not None:
+            covar.outputscale = kwgs.get(f'kern{i}_set_outputscale')
+        if kwgs.get(f'kern{i}_prior_lengthscale') is not None:
+            kern.register_prior(
+                'lengthscale_prior',
+                kwgs.get(f'kern{i}_prior_lengthscale'),
+                'lengthscale'
+                )
+        if kwgs.get(f'kern{i}_prior_outputscale') is not None:
+            covar.register_prior(
+                'outputscale_prior',
+                kwgs.get(f'kern{i}_prior_outputscale'),
+                'outputscale'
+                )
+
+        i += 1
+
+    if nonstn_scale:
+        covar = NonStationaryScaleKernel(train_x) * covar
+        if nonstn_bound is not None:
+            covar.kernels[0].register_constraint(
+                'lengthscale',
+                nonstn_bound
+            )
+        if nonstn_fix:
+            covar.kernels[0].raw_lengthscale.requires_grad = False
+        if nonstn_set is not None:
+            covar.kernels[0].lengthscale = nonstn_set
+        if nonstn_prior is not None:
+            covar.kernels[0].register_prior(
+                'lengthscale_prior',
+                nonstn_prior,
+                'lengthscale'
+                )
+
+    return mean, covar
 
 
 

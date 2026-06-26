@@ -176,11 +176,11 @@ def test_kron_woodbury_inpaint_real_data():
     assert out[flags].abs().median() < 10 * data[~flags].abs().median()   # filled, no blow-up
 
 
-def test_joint_shared_equals_per_baseline_loop():
-    """Joint mode (real path, unpack_complex=True) with shared flags+noise (1, Nt, Nf)
-    does ONE batched solve for all baselines; it must match the per-baseline loop (same
-    fit, same cores). Forced into the exact Cholesky regime so the two solve paths agree
-    to machine precision."""
+def test_joint_real_shared_equals_per_baseline_noise():
+    """Joint mode, real covariance (unpack_complex=True): passing flags+noise shared as
+    (1, Nt, Nf) vs the same broadcast to per-baseline (Nbls, ...) gives the identical
+    result -- both go through one batched kron solve over all (real/imag x baseline) RHS,
+    never a per-baseline loop."""
     data, flags, t, nu = _load(nbls=3, ntimes=16, fslice=slice(60, 90))    # N = 16*30
     Nbls = data.shape[0]
     shared_flags = flags[:1]                                               # (1, Nt, Nf) -> shared
@@ -188,16 +188,53 @@ def test_joint_shared_equals_per_baseline_loop():
     shared_noise = _flagged_noise(shared_noise, shared_flags)              # caller down-weights flags
 
     fk, tk = _real_kernels()                                               # real cores -> real path
-    with gpytorch.settings.max_cholesky_size(100000):                      # force exact solve
-        out_shared = inpaint(data, shared_flags, t, nu, noise=shared_noise, mode="joint",
-                             freq_kernel=fk, time_kernel=tk, unpack_complex=True, fit=False)
-        # same mask/noise broadcast to per-baseline -> exercises the loop instead
-        out_loop = inpaint(data, shared_flags.expand(Nbls, -1, -1).contiguous(), t, nu,
-                           noise=shared_noise.expand(Nbls, -1, -1).contiguous(),
-                           freq_kernel=fk, time_kernel=tk, mode="joint", unpack_complex=True, fit=False)
+    out_shared = inpaint(data, shared_flags, t, nu, noise=shared_noise, mode="joint",
+                         freq_kernel=fk, time_kernel=tk, unpack_complex=True, fit=False)
+    # the same mask/noise broadcast to per-baseline -> still one batched solve, not a loop
+    out_perbl = inpaint(data, shared_flags.expand(Nbls, -1, -1).contiguous(), t, nu,
+                        noise=shared_noise.expand(Nbls, -1, -1).contiguous(),
+                        freq_kernel=fk, time_kernel=tk, mode="joint", unpack_complex=True, fit=False)
 
     assert torch.isfinite(out_shared).all()
-    assert (out_shared - out_loop).abs().max() < 1e-9
+    assert (out_shared - out_perbl).abs().max() < 1e-9
+
+
+def test_joint_real_cov_cg_batches_no_loop():
+    """Real covariance + complex data in joint 'cg' mode batches all (real/imag x baseline)
+    RHS through one kron_wiener_cg -- no per-baseline loop, even with PER-baseline flags &
+    noise (which used to trigger the loop). The fill matches a dense per-baseline Wiener
+    solve, and n_jobs only changes parallelism, not the answer."""
+    torch.manual_seed(0)
+    Nbls, Nt, Nf = 6, 10, 14
+    times = torch.linspace(0, 50, Nt, dtype=torch.float64)
+    freqs = torch.linspace(120, 180, Nf, dtype=torch.float64)
+    kt = kernels.ScaleKernel(kernels.RBFKernel()).double(); kt.base_kernel.lengthscale = 15.0
+    kf = kernels.ScaleKernel(kernels.SincKernel()).double(); kf.base_kernel.lengthscale = 2.0
+    data = torch.randn(Nbls, Nt, Nf, dtype=torch.cdouble)
+    flags = torch.zeros(Nbls, Nt, Nf, dtype=bool)
+    for b in range(Nbls):
+        flags[b, :, 3 + b % 4] = True                  # per-baseline (non-shared) flags
+    noise = _flagged_noise((0.02 + 0.01 * torch.rand(Nbls, Nt, Nf)).double(), flags)
+
+    kw = dict(noise=noise, freq_kernel=kf, time_kernel=kt, mode='joint', method='cg',
+              unpack_complex=True, fit=False, center=False, cg_tol=1e-10, cg_max_iter=3000)
+    out = inpaint(data, flags, times, freqs, n_jobs=1, **kw)
+    out4 = inpaint(data, flags, times, freqs, n_jobs=4, **kw)
+
+    # dense per-baseline reference (a real cov acts identically on real & imag)
+    Ct = kt(times[:, None]).to_dense().detach(); Cf = kf(freqs[:, None]).to_dense().detach()
+    Ks = torch.kron(Ct, Cf)
+    ref = data.clone()
+    for b in range(Nbls):
+        A = Ks + torch.diag(noise[b].reshape(-1))
+        mr = (Ks @ torch.linalg.solve(A, data[b].real.reshape(-1))).reshape(Nt, Nf)
+        mi = (Ks @ torch.linalg.solve(A, data[b].imag.reshape(-1))).reshape(Nt, Nf)
+        ref[b] = torch.where(flags[b], torch.complex(mr, mi), data[b])
+
+    assert out.dtype == torch.cdouble
+    assert torch.allclose(out, ref, atol=1e-7)
+    assert torch.allclose(out4, ref, atol=1e-7)            # n_jobs is just parallelism
+    assert torch.allclose(out[~flags], data[~flags], atol=1e-8)
 
 
 def test_kron_woodbury_selftest():
@@ -333,6 +370,41 @@ def test_inpaint_joint_cg_complex():
     assert out.dtype == torch.cdouble
     assert torch.allclose(out[~flags], data[~flags], atol=1e-6)   # good pixels untouched
     assert torch.allclose(out, ref, atol=1e-7)                    # wired to the CG solver
+
+
+def test_inpaint_joint_eta_time_decorrelation():
+    """The joint-mode eta knob shrinks Ct toward its diagonal. eta=0 is the unchanged full
+    joint; eta=1 decouples the solve into per-time freq inpaints, so (with a unit-amplitude
+    time kernel, Ct[0,0]=1) joint(eta=1) must equal mode='freq'."""
+    torch.manual_seed(0)
+    Nt, Nf = 8, 12
+    times = torch.linspace(0., 50., Nt, dtype=torch.float64)
+    freqs = torch.linspace(120., 180., Nf, dtype=torch.float64)
+    # unit-amplitude complex time kernel so eta=1 (Ct -> Ct[0,0]*I = I) reduces exactly to
+    # a per-time freq solve with Cf
+    kt = kernels.CarrierKernel(kernels.ScaleKernel(kernels.RBFKernel()), tau=0.05).double()
+    kt.base_kernel.base_kernel.lengthscale = 8.0
+    kt.base_kernel.outputscale = 1.0
+    kf = kernels.ScaleKernel(kernels.SincKernel()).double()
+    kf.base_kernel.lengthscale = 2.0
+
+    data = torch.randn(2, Nt, Nf, dtype=torch.cdouble)
+    flags = torch.zeros(2, Nt, Nf, dtype=bool)
+    flags[:, :, 5] = True            # fully-flagged channel (freq-fillable)
+    flags[0, 3, 2] = True            # a scattered flag
+    noise = 0.05 ** 2 * torch.ones(2, Nt, Nf, dtype=torch.float64)
+    noise = _flagged_noise(noise, flags)
+
+    kw = dict(noise=noise, freq_kernel=kf, fit=False, center=False)
+    # eta=0 is a no-op (identical to the default full joint)
+    base = inpaint(data, flags, times, freqs, time_kernel=kt, mode="joint", method="woodbury", **kw)
+    eta0 = inpaint(data, flags, times, freqs, time_kernel=kt, mode="joint", method="woodbury", eta=0.0, **kw)
+    assert torch.equal(base, eta0)
+
+    # eta=1 decouples -> equals plain freq inpaint (exact via the cholesky/densify path)
+    j1 = inpaint(data, flags, times, freqs, time_kernel=kt, mode="joint", method="cholesky", eta=1.0, **kw)
+    fr = inpaint(data, flags, times, freqs, mode="freq", method="cholesky", **kw)
+    assert torch.allclose(j1, fr, atol=1e-8)
 
 
 def test_axis_inpaint_complex_kernel_ignores_unpack_complex():

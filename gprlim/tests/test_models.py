@@ -4,15 +4,40 @@ import gpytorch
 from gpytorch.means import ConstantMean
 from gpytorch.kernels import ScaleKernel, RBFKernel
 from gpytorch.priors import NormalPrior, GammaPrior
+from gpytorch.models import ExactGP
+from gpytorch.distributions import MultivariateNormal
+from gpytorch.likelihoods import FixedNoiseGaussianLikelihood
 
 from gprlim.models import (
     gpr_invert,
     cholesky_batched,
-    fixednoise_gp_1d,
     batched_log_prob,
     _sum_log_priors,
-    optimize_kernel,
+    posterior_mean,
+    fit_kernel,
 )
+
+
+# The library is functional (no GPModel); this minimal ExactGP exists ONLY here, as the
+# gpytorch reference for cross-checking batched_log_prob / fit_kernel in the real, small-N
+# regime where ExactMarginalLogLikelihood is exact (it is real-only and, for large N,
+# stochastic -- which is why the library uses the batched solvers instead).
+class _RefGP(ExactGP):
+    def __init__(self, x, y, noise, mean, covar):
+        super().__init__(x, y, FixedNoiseGaussianLikelihood(noise))
+        self.mean, self.covar = mean, covar
+
+    def forward(self, x):
+        return MultivariateNormal(self.mean(x), self.covar(x))
+
+
+def _ref_mll(x, y, noise, mean, covar):
+    """A trained gpytorch ExactGP and its ExactMarginalLogLikelihood (the reference loss);
+    shares the given ``mean``/``covar`` modules so grads/fits compare directly."""
+    model = _RefGP(x, y, noise, mean, covar)
+    model.train()
+    model.likelihood.train()
+    return model, gpytorch.mlls.ExactMarginalLogLikelihood(model.likelihood, model)
 
 
 def _legacy_pinv(C, N, B=None, y=None, rcond=1e-12):
@@ -56,7 +81,7 @@ def test_gpr_invert_methods_match_pinv():
 
 
 def test_predict_at_new_points():
-    """GPModel.predict(input_x) matches an explicit K(x*,X)(K+D)^-1(y-mu)+mu with a
+    """posterior_mean(input_x) matches an explicit K(x*,X)(K+D)^-1(y-mu)+mu with a
     true cross-covariance (m != n)."""
     torch.manual_seed(0)
     n, b, m = 40, 8, 25
@@ -65,11 +90,11 @@ def test_predict_at_new_points():
     noise = 0.1 + 0.05 * torch.rand(b, n, dtype=torch.float64)
 
     mean, covar = ConstantMean(), ScaleKernel(RBFKernel())
-    model, _ = fixednoise_gp_1d(train_x, train_y, mean, covar, inv_wgts=noise)
-    model.double()
+    mean.double()
+    covar.double()
 
     input_x = torch.linspace(0, 1, m, dtype=torch.float64)[None, :, None]
-    pred = model.predict(input_x=input_x)
+    pred = posterior_mean(covar, train_x, train_y, noise, input_x=input_x, mean=mean)
 
     with torch.no_grad():
         Cs = covar(train_x).to_dense().squeeze()             # (n, n)
@@ -116,64 +141,83 @@ def test_cholesky_batched_nonpd_fallback():
     assert (out - ref).abs().max() < 1e-8
 
 
-def _model_with_priors(x, y, noise):
+def _mean_covar_with_priors():
+    """A constant mean + scaled-RBF covariance with priors on the constant, lengthscale,
+    and outputscale (priors registered, then cast to double like the old model.double())."""
     mean, covar = ConstantMean(), ScaleKernel(RBFKernel())
     covar.base_kernel.register_prior('ls', GammaPrior(2.0, 1.0), 'lengthscale')
     covar.register_prior('os', GammaPrior(2.0, 1.0), 'outputscale')
     mean.register_prior('m', NormalPrior(0.0, 1.0), 'constant')
-    model, _ = fixednoise_gp_1d(x, y, mean, covar, inv_wgts=noise)
-    return model.double()
+    mean.double()
+    covar.double()
+    return mean, covar
 
 
 def test_batched_log_prob_matches_gpytorch_mll():
     """batched_log_prob (+ priors, mean-centering) reproduces gpytorch's
-    ExactMarginalLogLikelihood loss and gradients."""
+    ExactMarginalLogLikelihood loss and gradients (real, small-N reference)."""
     torch.manual_seed(0)
     n, b = 25, 5
     x = torch.linspace(0, 4, n, dtype=torch.float64)[None, :, None]
     y = torch.randn(b, n, dtype=torch.float64)
     noise = 0.1 + 0.05 * torch.rand(b, n, dtype=torch.float64)
 
-    model = _model_with_priors(x, y, noise)
-    model.train(); model.likelihood.train()
+    mean, covar = _mean_covar_with_priors()
+    params = dict(list(mean.named_parameters()) + list(covar.named_parameters()))
 
-    mll = gpytorch.mlls.ExactMarginalLogLikelihood(model.likelihood, model)
+    # gpytorch reference (shares the same mean/covar objects, so grads compare directly)
+    model, mll = _ref_mll(x, y, noise, mean, covar)
     model.zero_grad()
     ref = -mll(model(model.train_inputs[0]), model.train_targets).mean()
     ref.backward()
-    gref = {k: p.grad.clone() for k, p in model.named_parameters()}
+    gref = {k: p.grad.clone() for k, p in params.items()}
 
     for method in ('woodbury', 'cholesky'):
-        model.zero_grad()
-        xx = model.train_inputs[0]
-        lp = batched_log_prob(model.covar(xx).to_dense(), model.likelihood.noise,
-                              model.train_targets - model.mean(xx), method=method)
-        loss = -((lp + _sum_log_priors(model)) / n).mean()
+        for p in params.values():
+            p.grad = None
+        lp = batched_log_prob(covar(x).to_dense(), noise, y - mean(x), method=method)
+        loss = -((lp + _sum_log_priors(covar) + _sum_log_priors(mean)) / n).mean()
         loss.backward()
         assert abs(loss.item() - ref.item()) < 1e-9, method
-        for k, p in model.named_parameters():
-            if p.grad is not None:
-                assert (p.grad - gref[k]).abs().max() < 1e-8, (method, k)
+        for k, p in params.items():
+            assert (p.grad - gref[k]).abs().max() < 1e-8, (method, k)
 
 
-def test_optimize_kernel_batched_matches_default():
-    """optimize_kernel(batched=...) tracks the dense gpytorch path to the same fit."""
+def test_fit_kernel_matches_gpytorch():
+    """fit_kernel (batched MLL) tracks a gpytorch ExactMarginalLogLikelihood fit to the
+    same optimum (the dense gpytorch path, kept here only as a reference)."""
     torch.manual_seed(0)
     n, b = 30, 6
     x = torch.linspace(0, 5, n, dtype=torch.float64)[None, :, None]
     y = torch.randn(b, n, dtype=torch.float64)
     noise = 0.1 + 0.05 * torch.rand(b, n, dtype=torch.float64)
 
-    def fit(**kw):
+    def fit_ref():
         torch.manual_seed(1)
-        model = _model_with_priors(x, y, noise)
-        optimize_kernel(model, Niter=20, opt='Adam', lr=0.1, **kw)
-        return dict(model.named_parameters())
+        mean, covar = _mean_covar_with_priors()
+        model, mll = _ref_mll(x, y, noise, mean, covar)
+        opt = torch.optim.Adam(model.parameters(), lr=0.1)
+        for _ in range(20):
+            opt.zero_grad()
+            loss = -mll(model(model.train_inputs[0]), model.train_targets).mean()
+            loss.backward()
+            opt.step()
+        return mean, covar
 
-    base = fit()
+    def fit_batched(method):
+        torch.manual_seed(1)
+        mean, covar = _mean_covar_with_priors()
+        fit_kernel(covar, x, y, noise, mean=mean, Niter=20, opt='Adam', method=method, lr=0.1)
+        return mean, covar
+
+    def hyper(mc):
+        mean, covar = mc
+        return torch.tensor([float(covar.base_kernel.lengthscale.detach()),
+                             float(covar.outputscale.detach()), float(mean.constant.detach())])
+
+    base = hyper(fit_ref())
     for method in ('woodbury', 'cholesky'):
-        got = fit(batched=method)
-        assert max(float((got[k] - base[k]).abs().max()) for k in base) < 1e-7, method
+        assert (hyper(fit_batched(method)) - base).abs().max() < 1e-6, method
 
 
 def test_priors_active_and_recovered_in_batched():
@@ -192,21 +236,30 @@ def test_priors_active_and_recovered_in_batched():
     noise = 0.01 * torch.ones(b, n, dtype=torch.float64)
     x = xv[None, :, None]
 
-    def fit(prior=False, batched=None):
+    def fit(prior=False, method=None):
         torch.manual_seed(1)
         mean, covar = ConstantMean(), ScaleKernel(RBFKernel())
         covar.base_kernel.lengthscale = 1.0
         if prior:                                     # tight prior pulling ls -> 0.5
             covar.base_kernel.register_prior('ls', NormalPrior(0.5, 0.1), 'lengthscale')
-        model, _ = fixednoise_gp_1d(x, y, mean, covar, inv_wgts=noise)
-        model.double()
-        optimize_kernel(model, Niter=150, opt='Adam', lr=0.05, batched=batched)
-        return float(model.covar.base_kernel.lengthscale.detach())
+        mean.double()
+        covar.double()
+        if method is None:                            # gpytorch reference fit
+            model, mll = _ref_mll(x, y, noise, mean, covar)
+            opt = torch.optim.Adam(model.parameters(), lr=0.05)
+            for _ in range(150):
+                opt.zero_grad()
+                loss = -mll(model(model.train_inputs[0]), model.train_targets).mean()
+                loss.backward()
+                opt.step()
+        else:                                         # batched marginal-likelihood fit
+            fit_kernel(covar, x, y, noise, mean=mean, Niter=150, opt='Adam', method=method, lr=0.05)
+        return float(covar.base_kernel.lengthscale.detach())
 
-    ls_noprior = fit(prior=False)
-    ls_gpt = fit(prior=True, batched=None)
-    ls_wood = fit(prior=True, batched='woodbury')
-    ls_chol = fit(prior=True, batched='cholesky')
+    ls_noprior = fit(prior=False, method=None)
+    ls_gpt = fit(prior=True, method=None)
+    ls_wood = fit(prior=True, method='woodbury')
+    ls_chol = fit(prior=True, method='cholesky')
 
     # the prior is genuinely active: it pulls ls well away from the data-only fit,
     # toward the prior mean (0.5)

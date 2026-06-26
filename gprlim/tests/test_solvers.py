@@ -197,6 +197,33 @@ def test_kron_wiener_cg_batched(cplx):
         assert torch.allclose(m[b], _dense_wiener(P, F, noise[b], y[b]), atol=1e-5)
 
 
+@pytest.mark.parametrize("cplx", [False, True])
+def test_kron_wiener_cg_n_jobs_matches_serial(cplx):
+    """Parallelizing the CG over the baseline axis (n_jobs>1) is bit-for-bit the serial
+    result -- with per-baseline noise and with a shared (1, Nt, Nf) noise diagonal (the
+    operator is then identical across baselines, only the RHS differs)."""
+    Nt, Nf, B = 8, 7, 6
+    P, F = _kron_cores(Nt, Nf, cplx)
+    y = _vec((B, Nt, Nf), cplx, 21)
+    flags = torch.zeros(B, Nt, Nf, dtype=bool)
+    flags[:, 3, :] = True
+
+    # per-baseline noise
+    noise = 0.1 * torch.ones(B, Nt, Nf, dtype=DOUBLE)
+    noise[flags] = 1e6
+    serial, _ = solvers.kron_wiener_cg(P, F, noise, y, tol=1e-9, max_iter=2000, n_jobs=1)
+    for nj in (3, -1):
+        par, _ = solvers.kron_wiener_cg(P, F, noise, y, tol=1e-9, max_iter=2000, n_jobs=nj)
+        assert torch.allclose(par, serial, atol=1e-10), ("per-bl", nj)
+
+    # shared (1, Nt, Nf) noise broadcasts -> one operator for all baselines
+    shared = 0.1 * torch.ones(1, Nt, Nf, dtype=DOUBLE)
+    shared[flags[:1]] = 1e6
+    s1, _ = solvers.kron_wiener_cg(P, F, shared, y, tol=1e-9, max_iter=2000, n_jobs=1)
+    s4, _ = solvers.kron_wiener_cg(P, F, shared, y, tol=1e-9, max_iter=2000, n_jobs=4)
+    assert torch.allclose(s4, s1, atol=1e-10)
+
+
 # --------------------------------------------------------------------------------------
 # KroneckerKernel.cholesky (delegates to solvers.kron_cholesky): implicit L with L L^H = K
 # --------------------------------------------------------------------------------------
