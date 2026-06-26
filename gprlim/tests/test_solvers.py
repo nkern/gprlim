@@ -198,8 +198,8 @@ def test_kron_wiener_cg_batched(cplx):
 
 
 @pytest.mark.parametrize("cplx", [False, True])
-def test_kron_wiener_cg_n_jobs_matches_serial(cplx):
-    """Parallelizing the CG over the baseline axis (n_jobs>1) is bit-for-bit the serial
+def test_kron_wiener_cg_n_threads_matches_serial(cplx):
+    """Parallelizing the CG over the baseline axis (n_threads>1) is bit-for-bit the serial
     result -- with per-baseline noise and with a shared (1, Nt, Nf) noise diagonal (the
     operator is then identical across baselines, only the RHS differs)."""
     Nt, Nf, B = 8, 7, 6
@@ -211,16 +211,16 @@ def test_kron_wiener_cg_n_jobs_matches_serial(cplx):
     # per-baseline noise
     noise = 0.1 * torch.ones(B, Nt, Nf, dtype=DOUBLE)
     noise[flags] = 1e6
-    serial, _ = solvers.kron_wiener_cg(P, F, noise, y, tol=1e-9, max_iter=2000, n_jobs=1)
+    serial, _ = solvers.kron_wiener_cg(P, F, noise, y, tol=1e-9, max_iter=2000, n_threads=1)
     for nj in (3, -1):
-        par, _ = solvers.kron_wiener_cg(P, F, noise, y, tol=1e-9, max_iter=2000, n_jobs=nj)
+        par, _ = solvers.kron_wiener_cg(P, F, noise, y, tol=1e-9, max_iter=2000, n_threads=nj)
         assert torch.allclose(par, serial, atol=1e-10), ("per-bl", nj)
 
     # shared (1, Nt, Nf) noise broadcasts -> one operator for all baselines
     shared = 0.1 * torch.ones(1, Nt, Nf, dtype=DOUBLE)
     shared[flags[:1]] = 1e6
-    s1, _ = solvers.kron_wiener_cg(P, F, shared, y, tol=1e-9, max_iter=2000, n_jobs=1)
-    s4, _ = solvers.kron_wiener_cg(P, F, shared, y, tol=1e-9, max_iter=2000, n_jobs=4)
+    s1, _ = solvers.kron_wiener_cg(P, F, shared, y, tol=1e-9, max_iter=2000, n_threads=1)
+    s4, _ = solvers.kron_wiener_cg(P, F, shared, y, tol=1e-9, max_iter=2000, n_threads=4)
     assert torch.allclose(s4, s1, atol=1e-10)
 
 
@@ -256,35 +256,48 @@ def test_kronecker_kernel_cholesky(cplx):
 # --------------------------------------------------------------------------------------
 @pytest.mark.parametrize("cplx", [False, True])
 def test_shrink(cplx):
+    """shrink(C, rcond): variance-preserving blend toward diag(C) by eta = peakedness*rcond,
+    capping cond(C_eff) -> 1/rcond. Diagonal preserved; lazy == dense; rcond=1 -> diagonal."""
     torch.manual_seed(0)
-    n = 6
-    A = torch.randn(n, n, dtype=CDOUBLE if cplx else DOUBLE)
-    Ct = A @ A.conj().transpose(-1, -2) + n * torch.eye(n, dtype=A.dtype)   # Hermitian PD
+    n = 8
+    t = torch.linspace(0, 20, n, dtype=DOUBLE)
+    if cplx:
+        k = kernels.CarrierKernel(kernels.ScaleKernel(kernels.RBFKernel()), tau=0.1).double()
+        k.base_kernel.base_kernel.lengthscale = 5.0
+    else:
+        k = kernels.ScaleKernel(kernels.RBFKernel()).double(); k.base_kernel.lengthscale = 5.0
+    C = k(t[:, None]).to_dense().detach()                       # stationary, rank-deficient
 
-    # eta=0 / None are no-ops (same object)
-    assert solvers.shrink(Ct, 0.0) is Ct
-    assert solvers.shrink(Ct, None) is Ct
+    # rcond=0 / None are no-ops (same object)
+    assert solvers.shrink(C, 0.0) is C
+    assert solvers.shrink(C, None) is C
 
-    for eta in (0.25, 1.0):
-        S = solvers.shrink(Ct, eta)
-        # diagonal (marginal variance) preserved; off-diagonals scaled by (1 - eta)
-        assert torch.allclose(S.diagonal(), Ct.diagonal())
-        off = ~torch.eye(n, dtype=bool)
-        assert torch.allclose(S[off], (1.0 - eta) * Ct[off])
-        assert torch.allclose(S, (1.0 - eta) * Ct + torch.diag_embed(eta * Ct.diagonal()))
+    peak = torch.linalg.eigvalsh(C).amax() / C.diagonal().real.mean()    # lambda_max / mean(diag)
+    off = ~torch.eye(n, dtype=bool)
+    for rcond in (1e-4, 1e-2):
+        S = solvers.shrink(C, rcond)
+        eta = float((peak * rcond).clamp(max=1.0))             # the internally-fit blend fraction
+        assert torch.allclose(S.diagonal(), C.diagonal())                  # marginal variance kept
+        assert torch.allclose(S[off], (1.0 - eta) * C[off])                # off-diagonals scaled
+        assert torch.allclose(S, (1.0 - eta) * C + torch.diag_embed(eta * C.diagonal()))
 
-    # eta=1 -> pure diagonal
-    assert torch.allclose(solvers.shrink(Ct, 1.0), torch.diag_embed(Ct.diagonal()))
+    # headline property: rcond floors the spectrum -> cond(C_eff) ~ 1/rcond (in the regime
+    # where the floor binds, i.e. lambda_min(C)/lambda_max(C) << rcond; small (1-eta) bias)
+    ev = torch.linalg.eigvalsh(solvers.shrink(C, 1e-2))
+    assert abs((ev.amax() / ev.amin()).item() * 1e-2 - 1.0) < 0.08
+
+    # rcond=1 -> pure diagonal (eta clamps to 1, since peakedness >= 1)
+    assert torch.allclose(solvers.shrink(C, 1.0), torch.diag_embed(C.diagonal()))
 
     # lazy operator in -> operator out, same values as the dense path
-    op = solvers.to_linear_operator(Ct)
-    Sl = solvers.shrink(op, 0.25)
+    op = solvers.to_linear_operator(C)
+    Sl = solvers.shrink(op, 1e-2)
     assert hasattr(Sl, "to_dense")
-    assert torch.allclose(Sl.to_dense(), solvers.shrink(Ct, 0.25))
+    assert torch.allclose(Sl.to_dense(), solvers.shrink(C, 1e-2))
 
     # out-of-range guard
     with pytest.raises(ValueError):
-        solvers.shrink(Ct, 1.5)
+        solvers.shrink(C, 1.5)
 
 
 # --------------------------------------------------------------------------------------

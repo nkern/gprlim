@@ -67,26 +67,58 @@ def promote_like(a, ref):
     return a.to(ref.dtype) if (ref.is_complex() and not a.is_complex()) else a
 
 
-def shrink(Ct, eta):
+def shrink(C, rcond):
     r"""
-    Shrink a covariance toward its diagonal: ``(1 - eta) * Ct + eta * diag(Ct)`` (a
-    variance-preserving convex blend, ``eta`` in [0, 1]).
+    Cap a covariance's effective dynamic range by shrinking it toward its diagonal.
 
-    In the 2D joint solve this decorrelates the time axis: it caps the dominant time mode so
-    the frequency kernel sets the delay cutoff, reducing spectral leakage to high delay.
-    ``eta=0`` (or ``None``) is a no-op; ``eta=1`` -> pure diagonal (per-time freq solve).
-    See [[joint-eta-delay-confinement]].
+    Blends ``C`` toward ``diag(C)`` by a variance-preserving convex amount ``eta``,
 
-    Accepts a dense tensor (..., n, n) or a ``LinearOperator`` and returns the same kind.
+        C_eff = (1 - eta) * C + eta * diag(C),
+
+    with ``eta`` chosen so the result has condition number ``cond(C_eff) = 1 / rcond`` -- i.e.
+    the eigenvalues are floored at ``rcond * lambda_max(C)`` while the diagonal (marginal
+    variance) is preserved. ``rcond`` is the usual relative cutoff of ``numpy``/``torch``
+    ``pinv`` (``rcond = 1 / kappa`` for a target condition number ``kappa``).
+
+    For a stationary ``C`` (constant diagonal ``sigma^2``) this is exact: ``diag(C) = sigma^2 I``,
+    so ``C_eff`` has eigenvalues ``(1 - eta) lambda_i + eta sigma^2`` and the dead-mode floor
+    ``eta sigma^2 = rcond * lambda_max`` fixes
+
+        eta = peakedness * rcond,    peakedness = lambda_max(C) / mean(diag(C)).
+
+    In the 2D joint solve this is applied to the time factor ``Ct``: capping its dynamic range
+    caps the spread of the per-time-mode delay cutoffs, reducing spectral leakage to high delay.
+    Because ``peakedness`` absorbs the kernel's amplitude / shape / size (and is split- and
+    scale-invariant), one ``rcond`` (~ the trusted dynamic range / SNR^2) transfers across
+    kernels and baselines, unlike a raw blend fraction. See [[joint-eta-delay-confinement]].
+
+    Parameters
+    ----------
+    C : tensor or LinearOperator
+        Hermitian-PSD covariance of shape (..., n, n); a dense tensor or a ``LinearOperator``
+        (the same kind is returned). ``lambda_max`` is found via a dense ``eigvalsh`` (``C`` is
+        a small per-axis factor, so a ``LinearOperator`` is densified only for that scalar).
+    rcond : float or None
+        Relative eigenvalue floor in (0, 1]; ``cond(C_eff) = 1 / rcond``. ``0`` / ``None`` is a
+        no-op (returns ``C`` unchanged); ``rcond = 1`` -> pure diagonal (maximal shrink).
+
+    Returns
+    -------
+    tensor or LinearOperator
+        The shrunk covariance ``C_eff`` (same kind as ``C``).
     """
-    if not eta:                                   # 0 / 0.0 / None -> unchanged
-        return Ct
-    if not 0.0 <= eta <= 1.0:
-        raise ValueError(f"eta must be in [0, 1], got {eta}")
-    diag = Ct.diagonal(dim1=-2, dim2=-1)          # marginal variances, (..., n)
-    if isinstance(Ct, LinearOperator):
-        return Ct * (1.0 - eta) + DiagLinearOperator(eta * diag)
-    return (1.0 - eta) * Ct + torch.diag_embed(eta * diag)
+    if not rcond:                                 # 0 / 0.0 / None -> unchanged
+        return C
+    if not 0.0 < rcond <= 1.0:
+        raise ValueError(f"rcond must be in (0, 1], got {rcond}")
+    diag = C.diagonal(dim1=-2, dim2=-1)           # marginal variances, (..., n)
+    dense = C.to_dense() if isinstance(C, LinearOperator) else C
+    lam_max = torch.linalg.eigvalsh(dense).amax(-1)               # (...,)
+    eta = (lam_max / diag.real.mean(-1) * rcond).clamp(max=1.0)   # peakedness * rcond, capped at 1
+    if isinstance(C, LinearOperator):
+        e = float(eta)                            # lazy path: the non-batched (2D) case
+        return C * (1.0 - e) + DiagLinearOperator(e * diag)
+    return (1.0 - eta[..., None, None]) * C + torch.diag_embed(eta[..., None] * diag)
 
 
 # --------------------------------------------------------------------------------------
@@ -102,7 +134,7 @@ def _rnorm(a):
     return _rdot(a, a).clamp_min(0).sqrt()
 
 
-def pcg(A, b, M=None, tol=1e-6, max_iter=1000, x0=None):
+def pcg(A, b, M=None, tol=1e-6, max_iter=1000, x0=None, weight=None):
     """
     Preconditioned conjugate gradients for a Hermitian positive-definite system
     ``A x = b`` (real or complex), operating only through matrix-vector products.
@@ -126,6 +158,12 @@ def pcg(A, b, M=None, tol=1e-6, max_iter=1000, x0=None):
         Maximum iterations.
     x0 : tensor, optional
         Initial guess (default zeros).
+    weight : tensor, optional
+        Per-element weights (..., n) for the residual *norm only* (not the iteration): the stop
+        test uses ``sqrt(sum w |r|^2) / sqrt(sum w |b|^2)``. Pass the inverse noise variance
+        (``1/noise``) so high-variance (flagged) entries drop out of the convergence test --
+        otherwise their unfittable contribution to ``||b||`` makes ``tol`` data-dependent.
+        Default: unweighted (equivalent to ``weight`` constant).
 
     Returns
     -------
@@ -139,17 +177,21 @@ def pcg(A, b, M=None, tol=1e-6, max_iter=1000, x0=None):
     matvec = A if callable(A) else (lambda v: (A @ v.unsqueeze(-1)).squeeze(-1))
     apply_M = (lambda r: r) if M is None else M
     tiny = torch.finfo(b.real.dtype).tiny
+    # residual norm for the stop test: plain Euclidean, or inverse-variance-weighted (so
+    # high-noise / flagged entries drop out and `tol` is independent of the flag-var/noise ratio)
+    rnorm = _rnorm if weight is None else (
+        lambda v: (weight * (v.conj() * v).real).sum(-1, keepdim=True).clamp_min(0).sqrt())
 
     # r = residual b - A x ; z = preconditioned residual M^-1 r ; p = search direction.
     # rz = <r, z> is the quantity PCG drives to zero (real for Hermitian PD A and M).
     x = torch.zeros_like(b) if x0 is None else x0.clone()
     r = b - matvec(x)
-    bnorm = _rnorm(b).clamp_min(tiny)                      # denominator of the relative residual
+    bnorm = rnorm(b).clamp_min(tiny)                       # denominator of the relative residual
     z = apply_M(r)
     p = z.clone()
     rz = _rdot(r, z)
 
-    k, resid = 0, float((_rnorm(r) / bnorm).max())
+    k, resid = 0, float((rnorm(r) / bnorm).max())
     if resid <= tol:                                       # x0 already within tolerance
         return x, {'iters': 0, 'resid': resid}
     for k in range(1, max_iter + 1):
@@ -158,7 +200,7 @@ def pcg(A, b, M=None, tol=1e-6, max_iter=1000, x0=None):
         alpha = rz / _rdot(p, Ap).clamp_min(tiny)
         x = x + alpha * p                                  # advance the solution
         r = r - alpha * Ap                                 # ... and the residual
-        resid = float((_rnorm(r) / bnorm).max())           # worst row across the batch
+        resid = float((rnorm(r) / bnorm).max())            # worst row across the batch
         if resid <= tol:
             break
         z = apply_M(r)
@@ -271,7 +313,7 @@ def kron_matvec(Ct, Cf, diag=None):
     return mv
 
 
-def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=None, n_jobs=1):
+def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=None, n_threads=1):
     r"""
     Complex Wiener posterior mean  ``m = (Ct (x) Cf) (Ct (x) Cf + diag(noise))^-1 y``  via
     preconditioned CG: structured throughout (never densifies the ``(Ntimes*Nfreqs)^2``
@@ -292,13 +334,18 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
         Preconditioner diagonal shift; default the smallest noise value (the good-pixel
         variance), which makes the preconditioner capture the bulk of ``A``.
     tol, max_iter, x0
-        Forwarded to :func:`pcg`.
-    n_jobs : int, optional
+        Forwarded to :func:`pcg`. The stop test uses the inverse-variance-weighted relative
+        residual (``weight = 1/noise``), so high-variance flagged pixels drop out of it and
+        ``tol`` is a data-independent accuracy (e.g. ~1e-6) rather than something tied to the
+        flag-variance / good-pixel-noise ratio.
+    n_threads : int, optional
         Threads used to parallelize the CG over the leading (batch / baseline) axis. The
         per-axis eigendecompositions and the preconditioner are built once and shared; only
         the independent right-hand sides are split across threads (PyTorch releases the GIL
-        during the BLAS matvecs). Each batched matvec only lightly threads on its own, so on
-        many baselines this is where the cores come from. 1 = serial (default), k = k
+        during the BLAS matvecs). When ``n_threads > 1`` the BLAS intra-op thread count is pinned
+        to 1 for the duration (restored after) -- the per-axis matrices are small, so the
+        baseline axis is the efficient place to parallelize and this stops PyTorch's own BLAS
+        threading from oversubscribing the cores against the pool. 1 = serial (default), k = k
         threads, -1 = one per CPU. Capped at the batch size.
 
     Returns
@@ -322,13 +369,16 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
 
     def solve(yf, nf, xf):
         # alpha = (Ct (x) Cf + diag(noise))^-1 yf via preconditioned CG (A never densified),
-        # then the Wiener mean m = (Ct (x) Cf) alpha (one more structured matvec)
-        a, inf = pcg(kron_matvec(Ct, Cf, diag=nf), yf, M=M, tol=tol, max_iter=max_iter, x0=xf)
+        # then the Wiener mean m = (Ct (x) Cf) alpha (one more structured matvec). The stop
+        # test is inverse-variance-weighted (weight=1/noise) so flagged pixels drop out of it
+        # and `tol` is independent of the flag-var/noise ratio.
+        a, inf = pcg(kron_matvec(Ct, Cf, diag=nf), yf, M=M, tol=tol, max_iter=max_iter, x0=xf,
+                     weight=nf.reciprocal())
         return kron_matvec(Ct, Cf)(a), inf
 
     # number of independent right-hand sides (e.g. baselines) on the leading axis
     B = y_f.shape[0] if y_f.dim() > 1 else 1
-    nw = min(B, (os.cpu_count() or 1) if n_jobs in (-1, None) else max(1, n_jobs))
+    nw = min(B, (os.cpu_count() or 1) if n_threads in (-1, None) else max(1, n_threads))
     if nw <= 1:
         m, info = solve(y_f, noise_f, x0)
     else:
@@ -338,8 +388,15 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
         def work(c):
             return solve(y_f[c], noise_f[c] if per_bl_noise else noise_f,
                          x0[c] if x0 is not None else None)
-        with ThreadPoolExecutor(nw) as ex:
-            parts = list(ex.map(work, torch.arange(B).chunk(nw)))
+        # the baseline pool IS the parallelism: pin BLAS to one thread so PyTorch's own
+        # (small-matrix, per-axis) threading doesn't oversubscribe the cores against the pool.
+        old_threads = torch.get_num_threads()
+        try:
+            torch.set_num_threads(1)
+            with ThreadPoolExecutor(nw) as ex:
+                parts = list(ex.map(work, torch.arange(B).chunk(nw)))
+        finally:
+            torch.set_num_threads(old_threads)
         m = torch.cat([p[0] for p in parts], 0)
         info = {'iters': max(p[1]['iters'] for p in parts),
                 'resid': max(p[1]['resid'] for p in parts)}

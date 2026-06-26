@@ -1133,7 +1133,11 @@ def to_eigen(kernel, x, unravel=False, rcond=1e-12):
     return EigenKernel(V[:, keep], x, weights=w[keep].clamp_min(1e-30))
 
 
-def default_time_kernel(freqs, bl_vec, lat, buffer=None, hw_mult=1.0, min_hw=0.5, only_amp=True, negate=True):
+def default_time_kernel(
+    freqs, bl_vec, lat, buffer=None, hw_mult=1.0, min_hw=0.5,
+    ml_scale=1e2, fz_scale=1e-2, fr_scale=1e-4,
+    only_amp=True, only_global_amp=False, negate=True
+    ):
     r"""
     Default complex time (fringe-rate) kernel for a baseline, a sum of three components:
 
@@ -1174,9 +1178,18 @@ def default_time_kernel(freqs, bl_vec, lat, buffer=None, hw_mult=1.0, min_hw=0.5
         :func:`gprlim.utils.sky_frates`. Default 1.0.
     min_hw : float, optional
         Floor [mHz] on the sky-frate half-width (component 3). Default 0.5.
+    ml_scale : float, optional
+        Scaling of the main-lobe kernel (and the overall kernel itself)
+    fz_scale : float, optional 
+        Scaling of the FR=0 RBF kernel *relative* to the ml_scale
+    fr_scale : float, optional
+        Scaling of the full FR range Sinc kernel *relative* to the ml_scale
     only_amp : bool, optional
         If True (default) freeze every shape parameter (the RBF/Sinc lengthscales and the
         carrier taus), leaving only the amplitudes (outputscales) free to fit.
+    only_global_amp : bool, optional
+        If True, freeze all parameters expect for a single global ScaleKernel parameter.
+        Supersedes only_amp.
     negate : bool, optional
         If True (default) negate ``bl_vec``, flipping the sign of the computed fringe
         rates so a covariance draw's fringe-rate spectrum lands at the physical (not
@@ -1200,8 +1213,6 @@ def default_time_kernel(freqs, bl_vec, lat, buffer=None, hw_mult=1.0, min_hw=0.5
         lengthscale_prior=LogNormalPrior(np.log(750.0), 0.3)
     )
     ml.lengthscale = 750.0  # sec
-    if only_amp:
-        ml.raw_lengthscale.requires_grad_(False)
 
     # set frate of main lobe with tight prior
     ml = CarrierKernel(
@@ -1210,20 +1221,16 @@ def default_time_kernel(freqs, bl_vec, lat, buffer=None, hw_mult=1.0, min_hw=0.5
         tau_constraint=Interval(-50e-3, 50e-3),
         tau_prior=NormalPrior(ml_frate, ml_frate * 0.01),
     )
-    if only_amp:
-        ml.raw_tau.requires_grad_(False)
 
     ## FR=0 Kernel: with amplitude relative to main lobe kernel
     fz = ScaleKernel(
         RBFKernel(lengthscale_constraint=Interval(0, 1e4),
                   lengthscale_prior=LogNormalPrior(np.log(1e3), 0.3)),
         outputscale_constraint=Interval(1e-5, 1e2),
-        outputscale_prior=LogNormalPrior(np.log(1e-2), 5.0),
+        outputscale_prior=LogNormalPrior(np.log(fz_scale), 5.0),
     )
     fz.base_kernel.lengthscale = 1e3  # sec
-    fz.outputscale = 1e-2
-    if only_amp:
-        fz.base_kernel.raw_lengthscale.requires_grad_(False)
+    fz.outputscale = fz_scale
 
     ## Broad kernel: with amplitude relative to main lobe kernel
     # get frates of sky
@@ -1237,9 +1244,9 @@ def default_time_kernel(freqs, bl_vec, lat, buffer=None, hw_mult=1.0, min_hw=0.5
         SincKernel(lengthscale_constraint=Interval(ls * .8, ls * 1.2),
                    lengthscale_prior=LogNormalPrior(np.log(ls), 0.3)),
         outputscale_constraint=Interval(1e-5, 1e0),
-        outputscale_prior=LogNormalPrior(np.log(1e-4), 5.0)
+        outputscale_prior=LogNormalPrior(np.log(fr_scale), 5.0)
     )
-    sinc.outputscale = 1e-4
+    sinc.outputscale = fr_scale
     sinc.base_kernel.lengthscale = ls
     sinc = CarrierKernel(
         sinc,
@@ -1247,28 +1254,41 @@ def default_time_kernel(freqs, bl_vec, lat, buffer=None, hw_mult=1.0, min_hw=0.5
         tau_constraint=Interval(center - abs(center) * .2, center + abs(center) * .2),
         tau_prior=NormalPrior(center, center * 0.01),
     )
-    if only_amp:
+
+    # fix parameters if needed
+    if only_amp or only_global_amp:
+        ml.raw_tau.requires_grad_(False)
+        ml.base_kernel.raw_lengthscale.requires_grad_(False)
+        fz.base_kernel.raw_lengthscale.requires_grad_(False)
         sinc.raw_tau.requires_grad_(False)
         sinc.base_kernel.base_kernel.raw_lengthscale.requires_grad_(False)
+
+    if only_global_amp:
+        # also fix scale parameters
+        sinc.base_kernel.raw_outputscale.requires_grad_(False)
+        fz.raw_outputscale.requires_grad_(False)
+
 
     ## Add them all together with a universal scaling
     k = ScaleKernel(
         ml + fz + sinc,
         outputscale_constraint=Interval(1e-5, 1e10),
-        outputscale_prior=LogNormalPrior(np.log(1e2), 5.0),
+        outputscale_prior=LogNormalPrior(np.log(ml_scale), 5.0),
     )
-    k.outputscale = 1e2
+    k.outputscale = ml_scale
 
     return k
 
 
-def default_freq_kernel(bl_vec, buffer=None, min_delay=50.0, only_amp=True, twin=True):
-    """
+def default_freq_kernel(
+    bl_vec, buffer=0.0, min_delay=50.0, ml_scale=1e2, pf_scale=1e-1, wd_scale=1e-2, lk_scale=1e-3,
+    only_amp=True, only_global_amp=False, real=True):
+    r"""
     Default frequency kernel composed of
 
     1. RBFKernel for main lobe centered at delay = 0 ns
-    2. pitchfork at +/- baseline horizon: a real TwinRBFKernel (``twin=True``,
-       default) or two CarrierKernel(RBFKernel) (``twin=False``)
+    2. pitchfork at +/- baseline horizon: a real TwinRBFKernel (``real=True``,
+       default) or two CarrierKernel(RBFKernel) (``real=False``)
     3. SincKernel for -horizon < delays < horizon
     4. SincKernel for supra-horizon leakage
 
@@ -1279,9 +1299,9 @@ def default_freq_kernel(bl_vec, buffer=None, min_delay=50.0, only_amp=True, twin
     a delay in microseconds and a SincKernel of lengthscale ``l`` has a brick-wall
     delay band of +/- 1 / (2 l). The horizon delay |b| / c comes from
     :func:`gprlim.utils.sky_delay` (returned in ns, converted to us here). The
-    pitchfork covers the symmetric +/- horizon pair: with ``twin=True`` (default) a
+    pitchfork covers the symmetric +/- horizon pair: with ``real=True`` (default) a
     single real ``TwinRBFKernel`` (Gaussian-windowed cosine), so the whole kernel is
-    real-valued; with ``twin=False`` two ``CarrierKernel``s (one per sign), giving a
+    real-valued; with ``real=False`` two ``CarrierKernel``s (one per sign), giving a
     complex-dtype (Hermitian, zero-imaginary) kernel for the complex solver.
 
     Parameters
@@ -1295,10 +1315,21 @@ def default_freq_kernel(bl_vec, buffer=None, min_delay=50.0, only_amp=True, twin
     min_delay : float, optional
         Floor [ns] on the horizon delay (short baselines), and the fiducial inner
         delay scale setting the delay=0 main-lobe and pitchfork widths. Default 50.
+    ml_scale : float, optional
+        Overall scaling of the main-lobe (and the entire kernel)
+    pf_scale : float, optional
+        Scaling of pitchfork *relative* to main-lobe scale (variance)
+    wd_scale : float, optional
+        Scaling of full horizon wedge *relative* to main-lobe scale
+    lk_scale : float, optional
+        Scaling of supra-horizon leakage *relative* to main-lobe scale
     only_amp : bool, optional
         If True (default) freeze every shape parameter (all lengthscales and
         carrier taus), leaving only the amplitudes (outputscales) free to fit.
-    twin : bool, optional
+    only_global_amp : bool, optional
+        If True, freeze all parameters expect for a single global ScaleKernel parameter.
+        Supersedes only_amp.
+    real : bool, optional
         If True (default) model the pitchfork with one real ``TwinRBFKernel``, so the
         returned kernel is real-valued (use it with the real GP / real-imag-stacked
         path). If False, use two ``CarrierKernel``s and return a complex-dtype kernel
@@ -1328,26 +1359,22 @@ def default_freq_kernel(bl_vec, buffer=None, min_delay=50.0, only_amp=True, twin
         lengthscale_prior=LogNormalPrior(np.log(ls_main), 0.3),
     )
     ml.lengthscale = ls_main
-    if only_amp:
-        ml.raw_lengthscale.requires_grad_(False)
 
     ## 2. Pitchfork: symmetric +/- horizon band, amplitude relative to the main lobe
-    if twin:
+    if real:
         # single real TwinRBFKernel (Gaussian-windowed cosine) -> kernel stays real
         pf = ScaleKernel(
             TwinRBFKernel(lengthscale_constraint=Interval(0, 1e3),
                           lengthscale_prior=LogNormalPrior(np.log(ls_main * 3), 0.3),
                           tau_constraint=Interval(horizon * 0.8, horizon * 1.2),
                           tau_prior=NormalPrior(horizon, horizon * 0.01)),
-            outputscale_constraint=Interval(1e-5, 1e1),
-            outputscale_prior=LogNormalPrior(np.log(1e-2), 5.0),
+            outputscale_constraint=Interval(1e-6, 1e2),
+            outputscale_prior=LogNormalPrior(np.log(pf_scale), 5.0),
         )
         pf.base_kernel.lengthscale = ls_main * 3
         pf.base_kernel.tau = horizon
-        pf.outputscale = 1e-2
-        if only_amp:
-            pf.base_kernel.raw_lengthscale.requires_grad_(False)
-            pf.base_kernel.raw_tau.requires_grad_(False)
+        pf.outputscale = pf_scale
+
     else:
         # two CarrierKernels (one per sign), summed -> complex-dtype kernel
         pf = None
@@ -1355,52 +1382,67 @@ def default_freq_kernel(bl_vec, buffer=None, min_delay=50.0, only_amp=True, twin
             horn = ScaleKernel(
                 RBFKernel(lengthscale_constraint=Interval(0, 1e3),
                           lengthscale_prior=LogNormalPrior(np.log(ls_main * 3), 0.3)),
-                outputscale_constraint=Interval(1e-5, 1e1),
-                outputscale_prior=LogNormalPrior(np.log(1e-2), 5.0),
+                outputscale_constraint=Interval(1e-6, 1e2),
+                outputscale_prior=LogNormalPrior(np.log(pf_scale), 5.0),
             )
             horn.base_kernel.lengthscale = ls_main * 3
-            horn.outputscale = 1e-2
+            horn.outputscale = pf_scale
             horn = CarrierKernel(
                 horn, tau=tau,
                 tau_constraint=Interval(min(tau * 0.8, tau * 1.2), max(tau * 0.8, tau * 1.2)),
                 tau_prior=NormalPrior(tau, horizon * 0.01),
             )
-            if only_amp:
-                horn.base_kernel.base_kernel.raw_lengthscale.requires_grad_(False)
-                horn.raw_tau.requires_grad_(False)
             pf = horn if pf is None else pf + horn
 
     ## 3. Wedge interior: real Sinc brick-wall over -horizon < delay < horizon
     wedge = ScaleKernel(
         SincKernel(lengthscale_constraint=Interval(ls_wedge * 0.8, ls_wedge * 1.2),
                    lengthscale_prior=LogNormalPrior(np.log(ls_wedge), 0.3)),
-        outputscale_constraint=Interval(1e-5, 1e1),
-        outputscale_prior=LogNormalPrior(np.log(1e-1), 5.0),
+        outputscale_constraint=Interval(1e-6, 1e2),
+        outputscale_prior=LogNormalPrior(np.log(wd_scale), 5.0),
     )
     wedge.base_kernel.lengthscale = ls_wedge
-    wedge.outputscale = 1e-3
-    if only_amp:
-        wedge.base_kernel.raw_lengthscale.requires_grad_(False)
+    wedge.outputscale = wd_scale
 
     ## 4. Supra-horizon leakage: wider real Sinc brick-wall over +/- (horizon + buffer)
     supra_k = ScaleKernel(
         SincKernel(lengthscale_constraint=Interval(ls_supra * 0.8, ls_supra * 1.2),
                    lengthscale_prior=LogNormalPrior(np.log(ls_supra), 0.3)),
-        outputscale_constraint=Interval(1e-5, 1e0),
-        outputscale_prior=LogNormalPrior(np.log(1e-4), 5.0),
+        outputscale_constraint=Interval(1e-6, 1e4),
+        outputscale_prior=LogNormalPrior(np.log(lk_scale), 5.0),
     )
     supra_k.base_kernel.lengthscale = ls_supra
-    supra_k.outputscale = 1e-4
-    if only_amp:
+    supra_k.outputscale = lk_scale
+
+    if only_amp or only_global_amp:
+        ml.raw_lengthscale.requires_grad_(False)
+        if real:
+            pf.base_kernel.raw_lengthscale.requires_grad_(False)
+            pf.base_kernel.raw_tau.requires_grad_(False)
+        else:
+            pf.kernels[0].base_kernel.base_kernel.raw_lengthscale.requires_grad_(False)
+            pf.kernels[0].raw_tau.requires_grad_(False)
+            pf.kernels[1].base_kernel.base_kernel.raw_lengthscale.requires_grad_(False)
+            pf.kernels[1].raw_tau.requires_grad_(False)
+        wedge.base_kernel.raw_lengthscale.requires_grad_(False)
         supra_k.base_kernel.raw_lengthscale.requires_grad_(False)
+
+    if only_global_amp:
+        if real:
+            pf.raw_outputscale.requires_grad_(False)
+        else:
+            pf.kernels[0].raw_outputscale.requires_grad_(False)
+            pf.kernels[1].raw_outputscale.requires_grad_(False)
+        wedge.raw_outputscale.requires_grad_(False)
+        supra_k.raw_outputscale.requires_grad_(False)
 
     ## Add them all together with a universal scaling
     k = ScaleKernel(
         ml + pf + wedge + supra_k,
-        outputscale_constraint=Interval(1e-5, 1e10),
-        outputscale_prior=LogNormalPrior(np.log(1e2), 5.0),
+        outputscale_constraint=Interval(1e-10, 1e10),
+        outputscale_prior=LogNormalPrior(np.log(ml_scale), 5.0),
     )
-    k.outputscale = 1e2
+    k.outputscale = ml_scale
 
     return k
 

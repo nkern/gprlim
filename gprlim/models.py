@@ -77,7 +77,9 @@ def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend
                                   "use 'cholesky' or 'woodbury'.")
     x = torch.as_tensor(x).reshape(-1)
     Nx = x.shape[-1]
-    # move the sample axis to last and flatten the remaining axes into one batch
+    # move the sample axis to last and flatten the remaining axes into one batch; noise is
+    # broadcast to y's shape first (so a shared (1, ...) / lower-rank noise lines up per row)
+    noise = torch.broadcast_to(noise, y.shape)
     yp = y.movedim(dim, -1)
     lead = yp.shape[:-1]
     yf = yp.reshape(-1, Nx)
@@ -113,8 +115,8 @@ def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend
 
 
 def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=None,
-                      eta=None, method='woodbury', mu=None, dims=(-2, -1), detrend=False,
-                      rcond=1e-12, cg_tol=1e-8, cg_max_iter=1000, n_jobs=1):
+                      C1_rcond=None, method='woodbury', mu=None, dims=(-2, -1), detrend=False,
+                      rcond=1e-12, cg_tol=1e-4, cg_max_iter=5000, n_threads=1):
     """
     GP posterior mean for a separable 2D covariance ``K = C1 (x) C2`` (``C1 = kernel1`` over
     ``x1``, the slow/outer axis; ``C2 = kernel2`` over ``x2``), batched over the leading axis
@@ -137,12 +139,14 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
         Per-pixel noise variance, must broadcast with ``y``; flags should be a large value.
     pred_x1, pred_x2 : tensor, optional
         Prediction grids. NOT YET IMPLEMENTED -- pass None (predict on the (x1, x2) grid).
-    eta : float, optional
-        Time-decorrelation shrinkage of ``C1`` in [0, 1] (see :func:`gprlim.solvers.shrink`);
-        default None (no shrink).
+    C1_rcond : float, optional
+        Relative eigenvalue floor in (0, 1] applied to the outer factor ``C1`` to cap its
+        dynamic range to ``cond = 1 / C1_rcond`` (see :func:`gprlim.solvers.shrink`) -- the
+        time-decorrelation knob that confines spectral leakage to high delay. Default None
+        (no shrink). ``C1_rcond = 1 / kappa`` for a target condition number ``kappa``.
     method : str
         'woodbury' (default; low-rank, rank-truncated at ``rcond``), 'cg' (preconditioned CG,
-        to ``cg_tol``, parallelized over the batch by ``n_jobs``), or 'cholesky' (densify
+        to ``cg_tol``, parallelized over the batch by ``n_threads``), or 'cholesky' (densify
         ``C1 (x) C2`` -- small grids only).
     mu : callable, optional
         2D mean function ``mu(x1[:, None], x2[:, None]) -> (..., Nx1, Nx2)``; default zero mean.
@@ -150,7 +154,7 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
         Dimensions to perform 2D posterior mean. Maps dims to (-2, -1) of working tensor.
     detrend : bool, optional
         If True, do another global mean-subtraction after subtracting mu from data.
-    rcond, cg_tol, cg_max_iter, n_jobs
+    rcond, cg_tol, cg_max_iter, n_threads
         Forwarded to the chosen structured solver.
 
     Returns
@@ -165,7 +169,9 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
     x2 = torch.as_tensor(x2).reshape(-1)
     Nx1, Nx2 = x1.shape[-1], x2.shape[-1]
 
-    # move the two sample axes to the last two and flatten the rest into one batch
+    # move the two sample axes to the last two and flatten the rest into one batch; noise is
+    # broadcast to y's shape first (so a shared (1, ...) / lower-rank noise lines up per row)
+    noise = torch.broadcast_to(noise, y.shape)
     yp = y.movedim(dims, (-2, -1))
     lead = yp.shape[:-2]
     yf = yp.reshape(-1, Nx1, Nx2)
@@ -183,9 +189,8 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
             yc = yc - trend
 
         # dense per-axis factors (the (Nx1*Nx2)^2 covariance is never formed)
-        C1 = kernel1(x1[:, None]).to_dense().detach()
-        if eta:
-            C1 = shrink(C1, eta)                          # eta: decorrelate the outer axis
+        # cap C1's dynamic range (no-op if C1_rcond is None): decorrelates the outer axis
+        C1 = shrink(kernel1(x1[:, None]).to_dense().detach(), C1_rcond)
         C2 = kernel2(x2[:, None]).to_dense().detach()
 
         # complex strategy: split real/imag for a real covariance, else solve directly
@@ -203,7 +208,7 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
         if method == 'woodbury':
             mm = kron_woodbury_predict(C1, C2, nz, ys, rcond=rcond)
         elif method == 'cg':
-            mm, _ = kron_wiener_cg(C1, C2, nz, ys, tol=cg_tol, max_iter=cg_max_iter, n_jobs=n_jobs)
+            mm, _ = kron_wiener_cg(C1, C2, nz, ys, tol=cg_tol, max_iter=cg_max_iter, n_threads=n_threads)
         elif method == 'cholesky':
             Cs = torch.kron(C1, C2)
             nb = ys.shape[0]
@@ -265,8 +270,8 @@ def inpaint_1d(kernel, x, y, noise, flags, mu=None, dim=-1, detrend=False,
     return torch.where(flags, mdl, y), mdl
 
 
-def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, eta=None, mu=None, detrend=False,
-               method='woodbury', rcond=1e-12, cg_tol=1e-8, cg_max_iter=1000, n_jobs=1):
+def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, C1_rcond=None, mu=None, detrend=False,
+               method='woodbury', rcond=1e-12, cg_tol=1e-4, cg_max_iter=5000, n_threads=1):
     """
     Inpaint ``y`` at flagged pixels with the 2D GP posterior mean (separable ``C1 (x) C2``).
 
@@ -289,14 +294,16 @@ def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, eta=None, mu=None, det
         down-weighted (large variance).
     flags : tensor
         Boolean mask, same shape as ``y`` (True where flagged).
-    eta : float, optional
-        Time-decorrelation shrinkage of ``C1`` in [0, 1] (see :func:`gprlim.solvers.shrink`).
+    C1_rcond : float, optional
+        Relative eigenvalue floor in (0, 1] on the outer factor ``C1`` (caps its dynamic range
+        to ``cond = 1 / C1_rcond``; the delay-confinement knob -- see
+        :func:`gprlim.solvers.shrink` / :func:`posterior_mean_2d`).
     mu : callable, optional
         2D mean function ``mu(x1[:, None], x2[:, None]) -> (..., Nx1, Nx2)``.
     detrend : bool, optional
         Subtract an inverse-noise-weighted mean over the (x1, x2) axes before the solve and
         add it back (see :func:`posterior_mean_2d`).
-    method, rcond, cg_tol, cg_max_iter, n_jobs
+    method, rcond, cg_tol, cg_max_iter, n_threads
         Forwarded to :func:`posterior_mean_2d` (the structured solver).
 
     Returns
@@ -306,9 +313,9 @@ def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, eta=None, mu=None, det
     mdl : tensor
         The full posterior-mean model on the (x1, x2) grid (same shape/dtype as ``y``).
     """
-    mdl = posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, eta=eta, mu=mu, detrend=detrend,
-                            method=method, rcond=rcond, cg_tol=cg_tol, cg_max_iter=cg_max_iter,
-                            n_jobs=n_jobs)
+    mdl = posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, C1_rcond=C1_rcond, mu=mu,
+                            detrend=detrend, method=method, rcond=rcond, cg_tol=cg_tol,
+                            cg_max_iter=cg_max_iter, n_threads=n_threads)
     return torch.where(flags, mdl, y), mdl
 
 
@@ -496,9 +503,9 @@ def posterior_draws_1d(kernel, x, y, noise, mu=None, size=1, dim=-1, jitter=1e-1
     return f_post.movedim(-1, dim + 1 if dim >= 0 else dim)      # restore y's axis order (+ size)
 
 
-def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, eta=None,
-                       jitter=1e-10, method='woodbury', rcond=1e-12, cg_tol=1e-8,
-                       cg_max_iter=1000, n_jobs=1, generator=None):
+def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, C1_rcond=None,
+                       jitter=1e-10, method='woodbury', rcond=1e-12, cg_tol=1e-4,
+                       cg_max_iter=5000, n_threads=1, generator=None):
     """
     Draw samples from the separable 2D GP posterior given data ``y`` via Matheron's rule.
 
@@ -506,10 +513,10 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, eta=
 
         f_post = f_prior + posterior_mean(y - f_prior - eps),   eps ~ N(0, noise)
 
-    The prior draw uses the structured Kronecker Cholesky of the (``eta``-shrunk) ``C1 (x) C2``
-    and the correction reuses :func:`posterior_mean_2d`, so the ``(Nx1*Nx2)^2`` covariance is
-    never formed. Complex data is handled as in :func:`posterior_mean_2d`. A mean function
-    ``mu`` is carried by the prior draw (and so appears in the posterior samples).
+    The prior draw uses the structured Kronecker Cholesky of the (``C1_rcond``-shrunk)
+    ``C1 (x) C2`` and the correction reuses :func:`posterior_mean_2d`, so the ``(Nx1*Nx2)^2``
+    covariance is never formed. Complex data is handled as in :func:`posterior_mean_2d`. A mean
+    function ``mu`` is carried by the prior draw (and so appears in the posterior samples).
 
     Parameters
     ----------
@@ -527,12 +534,13 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, eta=
         prior draw; default zero mean.
     size : int, optional
         Number of posterior draws. Default 1.
-    eta : float, optional
-        Time-decorrelation shrinkage of ``C1`` in [0, 1] (see :func:`gprlim.solvers.shrink`);
-        applied to both the prior draw and the correction.
+    C1_rcond : float, optional
+        Relative eigenvalue floor in (0, 1] on the outer factor ``C1`` (caps its dynamic range
+        to ``cond = 1 / C1_rcond``; see :func:`gprlim.solvers.shrink`); applied to both the
+        prior draw and the correction.
     jitter : float, optional
         Relative diagonal jitter for the prior-draw Kronecker Cholesky.
-    method, rcond, cg_tol, cg_max_iter, n_jobs
+    method, rcond, cg_tol, cg_max_iter, n_threads
         Forwarded to :func:`posterior_mean_2d` for the Matheron correction.
     generator : torch.Generator, optional
         RNG for reproducible draws.
@@ -546,7 +554,7 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, eta=
     x2 = torch.as_tensor(x2).reshape(-1)
     n1, n2, Nb = x1.shape[-1], x2.shape[-1], y.shape[0]
     with torch.no_grad():
-        C1 = shrink(kernel1(x1[:, None]).to_dense(), eta)
+        C1 = shrink(kernel1(x1[:, None]).to_dense(), C1_rcond)
         C2 = kernel2(x2[:, None]).to_dense()
         dt = torch.promote_types(C1.dtype, C2.dtype)             # uniform factor dtype
         cov_c = dt.is_complex
@@ -558,9 +566,9 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, eta=
         eps = noise.sqrt() * _conv_normal((size, Nb, n1, n2), y.is_complex(), cov_c, generator)
         resid = (y.unsqueeze(0) - f_prior - eps).reshape(size * Nb, n1, n2)
         nr = noise.unsqueeze(0).expand(size, Nb, n1, n2).reshape(size * Nb, n1, n2)
-        corr = posterior_mean_2d(kernel1, kernel2, x1, x2, resid, nr, eta=eta, method=method,
+        corr = posterior_mean_2d(kernel1, kernel2, x1, x2, resid, nr, C1_rcond=C1_rcond, method=method,
                                  rcond=rcond, cg_tol=cg_tol, cg_max_iter=cg_max_iter,
-                                 n_jobs=n_jobs).reshape(size, Nb, n1, n2)
+                                 n_threads=n_threads).reshape(size, Nb, n1, n2)
     return f_prior + corr
 
 

@@ -341,7 +341,7 @@ def test_posterior_mean_1d():
 def test_posterior_mean_2d():
     """posterior_mean_2d (full 2D posterior mean on the grid, no flags) matches a dense
     per-baseline Wiener solve for woodbury/cg/cholesky, complex & real covariances, the
-    eta time-shrink, and a 2D mean function (mu) + detrend; pred_x raises NotImplementedError."""
+    C1_rcond time-shrink, and a 2D mean function (mu) + detrend; pred_x raises NotImplementedError."""
     torch.manual_seed(0)
     Nb, N1, N2 = 3, 6, 7
     x1 = torch.linspace(0, 50, N1, dtype=torch.float64)
@@ -374,9 +374,9 @@ def test_posterior_mean_2d():
                                  rcond=1e-12, cg_tol=1e-11, cg_max_iter=3000)
         assert torch.allclose(outr, dense_ref(C1r), atol=1e-6), ('split', method)
 
-    # eta shrink: matches a dense solve with the shrunk outer factor
-    out_e = posterior_mean_2d(k1c, k2, x1, x2, y, noise, eta=0.5, method='cholesky')
-    assert torch.allclose(out_e, dense_ref(shrink(C1c, 0.5)), atol=1e-6)
+    # C1_rcond shrink: matches a dense solve with the shrunk outer factor
+    out_e = posterior_mean_2d(k1c, k2, x1, x2, y, noise, C1_rcond=1e-2, method='cholesky')
+    assert torch.allclose(out_e, dense_ref(shrink(C1c, 1e-2)), atol=1e-6)
 
     # mu (2D mean fn) + detrend: subtract both before the solve, add both back to the prediction
     muf = lambda a, b: torch.full((a.shape[0], b.shape[0]), 0.3 + 0.2j, dtype=torch.cdouble)
@@ -402,6 +402,63 @@ def test_posterior_mean_2d():
     import pytest
     with pytest.raises(NotImplementedError):
         posterior_mean_2d(k1c, k2, x1, x2, y, noise, pred_x1=x1)
+
+
+def test_posterior_mean_broadcasts_noise():
+    """Shared / lower-rank noise broadcasts against y (the documented contract): 1d & 2d with
+    noise (1, ...) or (Nx,) match the fully-expanded noise -- regression for the Nbls>1
+    batch-mismatch bug (nf/yf had different leading sizes)."""
+    torch.manual_seed(0)
+    Nbls, Nt, Nf = 6, 5, 9
+    nu = torch.linspace(120, 180, Nf, dtype=torch.float64)
+    t = torch.linspace(0, 200, Nt, dtype=torch.float64)
+    kf = kernels.ScaleKernel(kernels.SincKernel()).double(); kf.base_kernel.lengthscale = 3.0
+    kt = kernels.ScaleKernel(kernels.RBFKernel()).double(); kt.base_kernel.lengthscale = 40.0
+    y = torch.randn(Nbls, Nt, Nf, dtype=torch.cdouble)
+
+    # 1D (freq): shared (1, Nt, Nf) and lower-rank (Nf,) both broadcast over (Nbls, Nt)
+    nz1 = 0.05 + torch.rand(1, Nt, Nf, dtype=torch.float64)
+    for method in ('cholesky', 'woodbury'):
+        out = posterior_mean_1d(kf, nu, y, nz1, method=method)
+        ref = posterior_mean_1d(kf, nu, y, nz1.expand(Nbls, -1, -1).contiguous(), method=method)
+        assert torch.allclose(out, ref, atol=1e-9), method
+    nzrow = 0.05 + torch.rand(Nf, dtype=torch.float64)
+    assert torch.allclose(posterior_mean_1d(kf, nu, y, nzrow),
+                          posterior_mean_1d(kf, nu, y, nzrow.expand(Nbls, Nt, Nf).contiguous()),
+                          atol=1e-9)
+
+    # 2D (joint): shared (1, Nt, Nf) broadcasts over the baseline axis, all methods
+    nz2 = 0.05 + torch.rand(1, Nt, Nf, dtype=torch.float64)
+    for method in ('cholesky', 'woodbury', 'cg'):
+        out = posterior_mean_2d(kt, kf, t, nu, y, nz2, method=method, cg_tol=1e-11, cg_max_iter=3000)
+        ref = posterior_mean_2d(kt, kf, t, nu, y, nz2.expand(Nbls, -1, -1).contiguous(),
+                                method=method, cg_tol=1e-11, cg_max_iter=3000)
+        assert torch.allclose(out, ref, atol=1e-7), method
+
+
+def test_cg_tol_flag_invariant():
+    """cg_tol is data-independent: with the inverse-variance-weighted CG stop test, a fixed
+    cg_tol reaches the dense Wiener mean to the same accuracy whether flagged pixels carry
+    flag_var=1e6 or 1e12 -- regression for the flag-var/noise-sensitive convergence."""
+    torch.manual_seed(0)
+    Nt, Nf = 10, 16
+    t = torch.linspace(0, 120, Nt, dtype=torch.float64)
+    nu = torch.linspace(120, 180, Nf, dtype=torch.float64)
+    kt = kernels.ScaleKernel(kernels.RBFKernel()).double(); kt.base_kernel.lengthscale = 40.0
+    kf = kernels.ScaleKernel(kernels.SincKernel()).double(); kf.base_kernel.lengthscale = 3.0
+    Ks = torch.kron(kt(t[:, None]).to_dense().detach(),
+                    kf(nu[:, None]).to_dense().detach()).to(torch.cdouble)
+
+    y = torch.randn(1, Nt, Nf, dtype=torch.cdouble)
+    flags = torch.zeros(1, Nt, Nf, dtype=bool); flags[0, :, 7] = True; flags[0, 4, :] = True
+    y[flags] = 50.0                                          # RFI-like garbage at flagged pixels
+    base = 0.01 * torch.ones(1, Nt, Nf, dtype=torch.float64)
+    for flag_var in (1e6, 1e12):
+        nz = base.clone(); nz[flags] = flag_var
+        out = posterior_mean_2d(kt, kf, t, nu, y, nz, method='cg', cg_tol=1e-6, cg_max_iter=4000)
+        A = Ks + torch.diag(nz.reshape(-1).to(torch.cdouble))
+        ref = (Ks @ torch.linalg.solve(A, y.reshape(-1))).reshape(Nt, Nf)
+        assert (out[0] - ref).abs().max() < 1e-6, flag_var
 
 
 def test_inpaint_1d_2d():
