@@ -27,18 +27,66 @@ The batched dense solvers instead take a single (Nsamples x Nsamples) signal cov
 ``C`` shared across a batch of per-row noise diagonals -- the per-axis ('freq'/'time'-mode)
 workhorse, and the dense dual of the Kronecker routines above:
 
-* :func:`gpr_invert` (dispatching to :func:`woodbury_batched` / :func:`cholesky_batched`,
-  with :func:`gp_predict` the Wiener-mean wrapper) -- ``B (C + diag(N_b))^-1 y_b`` per row.
+* :func:`gpr_invert` (dispatching to :func:`woodbury_batched` / :func:`cholesky_batched`)
+  -- the Wiener-mean ``B (C + diag(N_b))^-1 y_b`` per row.
 """
 import os
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
-from linear_operator import to_linear_operator
+from linear_operator import LinearOperator, to_linear_operator
 from linear_operator.operators import (
+    DiagLinearOperator,
     TriangularLinearOperator,
     KroneckerProductTriangularLinearOperator,
 )
+
+
+# --------------------------------------------------------------------------------------
+# complex-data helpers (shared by the dense and Kronecker Wiener solves)
+# --------------------------------------------------------------------------------------
+# A real covariance acts identically on the real and imaginary parts of complex data, so
+# the parts can be stacked and solved as two real systems (cheaper) and recombined; a
+# complex covariance couples them and must be solved directly (a real one then promoted).
+def stack_ri(x):
+    """Stack complex ``x``'s real & imag parts along the leading (row) axis; real ``x`` is
+    returned unchanged. (Nrows, ...) complex -> (2*Nrows, ...) real."""
+    return torch.cat([x.real, x.imag], 0) if x.is_complex() else x
+
+
+def unstack_ri(x):
+    """Inverse of :func:`stack_ri`: fold a leading [real, imag] stack back into complex.
+    (2*Nrows, ...) real -> (Nrows, ...) complex."""
+    h = x.shape[0] // 2
+    return torch.complex(x[:h], x[h:])
+
+
+def promote_like(a, ref):
+    """Promote real ``a`` to ``ref``'s (complex) dtype so a real covariance can solve a
+    complex system directly; a no-op if ``ref`` is real or ``a`` is already complex."""
+    return a.to(ref.dtype) if (ref.is_complex() and not a.is_complex()) else a
+
+
+def shrink(Ct, eta):
+    r"""
+    Shrink a covariance toward its diagonal: ``(1 - eta) * Ct + eta * diag(Ct)`` (a
+    variance-preserving convex blend, ``eta`` in [0, 1]).
+
+    In the 2D joint solve this decorrelates the time axis: it caps the dominant time mode so
+    the frequency kernel sets the delay cutoff, reducing spectral leakage to high delay.
+    ``eta=0`` (or ``None``) is a no-op; ``eta=1`` -> pure diagonal (per-time freq solve).
+    See [[joint-eta-delay-confinement]].
+
+    Accepts a dense tensor (..., n, n) or a ``LinearOperator`` and returns the same kind.
+    """
+    if not eta:                                   # 0 / 0.0 / None -> unchanged
+        return Ct
+    if not 0.0 <= eta <= 1.0:
+        raise ValueError(f"eta must be in [0, 1], got {eta}")
+    diag = Ct.diagonal(dim1=-2, dim2=-1)          # marginal variances, (..., n)
+    if isinstance(Ct, LinearOperator):
+        return Ct * (1.0 - eta) + DiagLinearOperator(eta * diag)
+    return (1.0 - eta) * Ct + torch.diag_embed(eta * diag)
 
 
 # --------------------------------------------------------------------------------------
@@ -312,8 +360,8 @@ def kron_woodbury_predict(Ct, Cf, noise, y, rcond=1e-12):
     a ``(k_t*k_f) x (k_t*k_f)`` capacitance is inverted, so this is a *direct*, high-
     dynamic-range-safe solve -- a Cholesky of that small capacitance, no CG / no iteration
     -- and a large flagged-pixel variance enters benignly as its reciprocal. It is the dual
-    of the structured per-baseline solve of :func:`gprlim.workflows.inpaint`
-    (``mode='joint'``): a win exactly when the kernels are low rank (the smooth-kernel
+    of the structured per-baseline solve of :func:`gprlim.models.posterior_mean_2d`
+    (the joint 2D path): a win exactly when the kernels are low rank (the smooth-kernel
     regime); for full-rank kernels the capacitance is ``N x N`` and a dense / CG solve is
     preferable.
 
@@ -385,7 +433,7 @@ def kron_woodbury_inpaint(data, flags, Ct, Cf, noise, rcond=1e-12, huge=1e12):
     r"""
     Joint (time x frequency) inpaint via the batched Kronecker-Woodbury solver
     (:func:`kron_woodbury_predict`) -- a no-densify alternative to
-    ``gprlim.workflows.inpaint(mode='joint')`` when the kernels are low rank. Flagged
+    :func:`gprlim.models.inpaint_2d` when the kernels are low rank. Flagged
     pixels are given a large noise variance (``huge``) and replaced by the Wiener
     posterior mean; good pixels are returned untouched.
 
@@ -701,39 +749,4 @@ def gpr_invert(C, N, B=None, y=None, rcond=1e-15, method='cholesky', chunk=None)
                 ], dim=0)
 
     return out
-
-
-def gp_predict(Cs, Cn, train_y, Cp=None, rcond=1e-15, method='cholesky', chunk=None):
-    """
-    Compute MAP estimate of signal
-        Cp (Cs + Cn)^-1 y
-
-    Parameters
-    ----------
-    Cs : tensor
-        Covariance matrix of signal (Nsamples, Nsamples)
-    Cn : tensor
-        Variance diagonal of noise ([Nbatch], Nsamples)
-    train_y : tensor
-        Training data ([Nbatch], Nsamples)
-    Cp : tensor
-        Covariance of training points and prediction points.
-        Default is Cs, but can also predict at new points
-        not in training vector (Npredict, Nsamples)
-    rcond : float
-        Relative condition / eigenvalue cutoff.
-    method : str
-        Batched solver, 'cholesky' (default) or 'woodbury'. See `gpr_invert`.
-    chunk : int, optional
-        Process the batch in chunks of this size to bound memory.
-
-    Returns
-    -------
-    Tensor
-    """
-    if Cp is None:
-        Cp = Cs
-
-    # get prediction for all training samples
-    return gpr_invert(Cs, Cn, B=Cp, y=train_y, rcond=rcond, method=method, chunk=chunk)
 

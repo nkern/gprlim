@@ -983,72 +983,65 @@ class NS_SincKernel(LinearLengthscaleKernel):
 
 class KroneckerKernel(Kernel):
     r"""
-    Kronecker product of per-axis base kernels, ``K = K_0 (x) K_1 (x) ...``, kept as a
-    ``KroneckerProductLinearOperator`` -- the full (unraveled) covariance is never
-    formed. Autodiff flows through the factor kernels' parameters, and the marginal
-    likelihood / posterior solve use the structured operator (implicit inversion and
-    log-det), so this is amenable to MLL fitting and GPR inversion at scale.
-
-    Each factor kernel is evaluated on its own 1D axis grid (stored at construction).
-    The unravel convention is the standard row-major one (axis 0 varies slowest), so
-    the GP's training inputs must be that unraveled grid.
+    Separable 2D time-frequency covariance ``K = Ct (x) Cf``, kept as a
+    ``KroneckerProductLinearOperator`` -- the full ``(Ntimes*Nfreqs)^2`` covariance is
+    never formed. ``Ct`` and ``Cf`` are the per-axis factor *kernels*, evaluated lazily on
+    their 1D grids; autodiff flows through their parameters, and the structured solvers
+    (:func:`gprlim.solvers.kron_woodbury_predict` / :func:`gprlim.solvers.kron_wiener_cg`)
+    consume the dense factors (:meth:`factor_mats`) directly. The unravel convention is
+    row-major: time is the slow / outer axis, frequency the fast / inner axis.
 
     Parameters
     ----------
-    kernels : list of gpytorch.kernels.Kernel
-        List of base kernels, one per axis (e.g. ``EigenKernel``, ``RBFKernel``,
-        ``NS_SincKernel``).
-    grids : list of tensor
-        List of 1D grids, one per axis.
+    Ct : gpytorch.kernels.Kernel
+        Time-axis factor kernel (may be complex-valued, e.g. a :class:`CarrierKernel`).
+    Cf : gpytorch.kernels.Kernel
+        Frequency-axis factor kernel.
+    times : tensor
+        1D time grid, shape (Ntimes,).
+    freqs : tensor
+        1D frequency grid, shape (Nfreqs,).
     """
 
     is_stationary = False
 
-    def __init__(self, kernels, grids, **kwargs):
+    def __init__(self, Ct, Cf, times, freqs, **kwargs):
         super().__init__(**kwargs)
-        self.kernels = torch.nn.ModuleList(kernels)
-        self._n_axes = len(kernels)
-        for i, g in enumerate(grids):
-            self.register_buffer(f'grid_{i}', torch.as_tensor(g).reshape(-1))
+        self.Ct = Ct
+        self.Cf = Cf
+        self.register_buffer('times', torch.as_tensor(times).reshape(-1))
+        self.register_buffer('freqs', torch.as_tensor(freqs).reshape(-1))
 
-    def _axis_grid(self, i):
-        return getattr(self, f'grid_{i}')
-
-    def _factor_mats(self):
-        """Dense per-axis covariance factors on the (real) coordinate grids, promoted to
-        a common dtype so a complex factor (CarrierKernel time axis) and a real factor
-        (real freq axis) can compose."""
-        # Sub-kernel parameters must be REAL: RBF/Sinc form a (real) squared distance
+    def factor_mats(self):
+        """Dense per-axis covariance factors ``(Ct(times), Cf(freqs))``, promoted to a
+        common dtype so a complex factor (e.g. a CarrierKernel time axis) and a real factor
+        (real freq axis) compose."""
+        # Factor-kernel parameters must be REAL: RBF/Sinc form a (real) squared distance
         # internally (clamp_min_(0)), which errors on complex tensors. A complex-valued
         # covariance must come from a CarrierKernel/complex EigenKernel evaluated on real
         # inputs -- not from casting the kernel/grids to complex.
         for name, p in self.named_parameters():
             if p.is_complex():
                 raise ValueError(
-                    f"KroneckerKernel sub-kernel parameter '{name}' is complex. Grids and "
-                    "sub-kernel parameters must be real: build the factor kernels with "
+                    f"KroneckerKernel factor-kernel parameter '{name}' is complex. Grids and "
+                    "factor-kernel parameters must be real: build the factor kernels with "
                     ".double() (not .to(torch.cdouble)). The complex covariance is produced "
                     "by the CarrierKernel carrier (or a complex EigenKernel) on real inputs."
                 )
-        mats = []
-        for i in range(self._n_axes):
-            g = self._axis_grid(i)
-            g = g.real if g.is_complex() else g          # coordinates are real
-            mats.append(self.kernels[i](g.unsqueeze(-1)).to_dense())
-        dtype = mats[0].dtype
-        for m in mats[1:]:
-            dtype = torch.promote_types(dtype, m.dtype)
-        return [m.to(dtype) for m in mats]
+        Ct = self.Ct(self.times.unsqueeze(-1)).to_dense()
+        Cf = self.Cf(self.freqs.unsqueeze(-1)).to_dense()
+        dtype = torch.promote_types(Ct.dtype, Cf.dtype)
+        return Ct.to(dtype), Cf.to(dtype)
 
     def covariance(self):
-        """The sparse ``KroneckerProductLinearOperator`` on the full unraveled grid."""
-        return KroneckerProductLinearOperator(*[to_linear_operator(m) for m in self._factor_mats()])
+        """The structured ``KroneckerProductLinearOperator`` ``Ct (x) Cf`` (never densified)."""
+        return KroneckerProductLinearOperator(*[to_linear_operator(m) for m in self.factor_mats()])
 
     def cholesky(self, jitter=1e-10):
         r"""
         Implicit lower-triangular Cholesky factor ``L`` with ``L L^H = K``, kept as a
         ``KroneckerProductTriangularLinearOperator`` via ``chol(A (x) B) = chol(A) (x)
-        chol(B)`` -- the full ``(prod N_i)`` factor is never densified.
+        chol(B)`` -- the full ``(Ntimes*Nfreqs)`` factor is never densified.
 
         Each axis kernel is factorized with ``torch.linalg.cholesky`` (which handles a
         complex-Hermitian kernel, unlike ``linear_operator``'s ``psd_safe_cholesky`` whose
@@ -1070,7 +1063,7 @@ class KroneckerKernel(Kernel):
         -------
         KroneckerProductTriangularLinearOperator
         """
-        return solvers.kron_cholesky(self._factor_mats(), jitter=jitter)
+        return solvers.kron_cholesky(self.factor_mats(), jitter=jitter)
 
     def sample(self, sample_shape=(), jitter=1e-6, generator=None):
         r"""Prior draw ``x = L w`` with ``w`` standard [complex] normal of ``L``'s
@@ -1102,32 +1095,32 @@ def to_eigen(kernel, x, unravel=False, rcond=1e-12):
     the modes become fixed buffers and only the per-mode weights remain free (to be
     fine-tuned by marginal likelihood).
 
-    With ``unravel=True``, ``kernel`` is a list of per-axis kernels and ``x`` a list of
-    per-axis grids; each axis is compiled to an ``EigenKernel`` and the pieces are
-    assembled into a sparse :class:`KroneckerKernel` (``K = (x)_axes``) that never forms
-    the full covariance. (To keep an axis parametric instead -- e.g. ``RBFKernel`` --
-    build the ``KroneckerKernel`` directly with that base kernel.)
+    With ``unravel=True``, ``kernel`` is the pair ``[time_kernel, freq_kernel]`` and ``x``
+    the pair ``[times, freqs]``; each axis is compiled to an ``EigenKernel`` and the two are
+    assembled into a 2D :class:`KroneckerKernel` (``K = Ct (x) Cf``) that never forms the
+    full covariance. (To keep an axis parametric instead -- e.g. ``RBFKernel`` -- build the
+    ``KroneckerKernel`` directly with that base kernel.)
 
     Parameters
     ----------
-    kernel : gpytorch.kernels.Kernel or list of gpytorch.kernels.Kernel
-        A kernel instance, or a list of per-axis kernels if ``unravel``.
-    x : tensor or list of tensor
-        A 1D grid, or a list of per-axis grids if ``unravel``.
+    kernel : gpytorch.kernels.Kernel or [time_kernel, freq_kernel]
+        A kernel instance, or the time/frequency factor kernels if ``unravel``.
+    x : tensor or [times, freqs]
+        A 1D grid, or the time/frequency grids if ``unravel``.
     unravel : bool, optional
-        Assemble a ``KroneckerKernel`` of per-axis ``EigenKernel`` factors.
+        Assemble a 2D ``KroneckerKernel`` of per-axis ``EigenKernel`` factors.
     rcond : float, optional
         Relative eigenvalue cutoff for the low-rank truncation.
 
     Returns
     -------
     EigenKernel or KroneckerKernel
-        An ``EigenKernel`` (or a ``KroneckerKernel`` if ``unravel``).
+        An ``EigenKernel`` (or a 2D ``KroneckerKernel`` if ``unravel``).
     """
     if unravel:
-        grids = [torch.as_tensor(xi).reshape(-1) for xi in x]
-        factors = [to_eigen(k, g, rcond=rcond) for k, g in zip(kernel, grids)]
-        return KroneckerKernel(factors, grids)
+        kt, kf = kernel
+        gt, gf = (torch.as_tensor(xi).reshape(-1) for xi in x)
+        return KroneckerKernel(to_eigen(kt, gt, rcond=rcond), to_eigen(kf, gf, rcond=rcond), gt, gf)
 
     x = torch.as_tensor(x).reshape(-1)
     with torch.no_grad():

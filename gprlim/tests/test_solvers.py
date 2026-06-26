@@ -240,7 +240,7 @@ def test_kronecker_kernel_cholesky(cplx):
     if cplx:                                          # CarrierKernel -> complex Hermitian core
         kt = kernels.CarrierKernel(kt, tau=0.3).double()
 
-    kron = kernels.KroneckerKernel([kt, kf], [times, freqs])
+    kron = kernels.KroneckerKernel(kt, kf, times, freqs)
     L = kron.cholesky()                               # KroneckerProductTriangularLinearOperator
     Ld = L.to_dense()
     K = kron.covariance().to_dense()
@@ -249,3 +249,81 @@ def test_kronecker_kernel_cholesky(cplx):
     assert torch.allclose(Ld, torch.tril(Ld))                       # lower triangular
     assert torch.allclose(Ld @ Ld.conj().transpose(-1, -2), K, atol=1e-6)   # L L^H = K
     assert torch.linalg.eigvalsh(K).min() > -1e-8                   # PSD
+
+
+# --------------------------------------------------------------------------------------
+# shrink: variance-preserving shrinkage of a covariance toward its diagonal
+# --------------------------------------------------------------------------------------
+@pytest.mark.parametrize("cplx", [False, True])
+def test_shrink(cplx):
+    torch.manual_seed(0)
+    n = 6
+    A = torch.randn(n, n, dtype=CDOUBLE if cplx else DOUBLE)
+    Ct = A @ A.conj().transpose(-1, -2) + n * torch.eye(n, dtype=A.dtype)   # Hermitian PD
+
+    # eta=0 / None are no-ops (same object)
+    assert solvers.shrink(Ct, 0.0) is Ct
+    assert solvers.shrink(Ct, None) is Ct
+
+    for eta in (0.25, 1.0):
+        S = solvers.shrink(Ct, eta)
+        # diagonal (marginal variance) preserved; off-diagonals scaled by (1 - eta)
+        assert torch.allclose(S.diagonal(), Ct.diagonal())
+        off = ~torch.eye(n, dtype=bool)
+        assert torch.allclose(S[off], (1.0 - eta) * Ct[off])
+        assert torch.allclose(S, (1.0 - eta) * Ct + torch.diag_embed(eta * Ct.diagonal()))
+
+    # eta=1 -> pure diagonal
+    assert torch.allclose(solvers.shrink(Ct, 1.0), torch.diag_embed(Ct.diagonal()))
+
+    # lazy operator in -> operator out, same values as the dense path
+    op = solvers.to_linear_operator(Ct)
+    Sl = solvers.shrink(op, 0.25)
+    assert hasattr(Sl, "to_dense")
+    assert torch.allclose(Sl.to_dense(), solvers.shrink(Ct, 0.25))
+
+    # out-of-range guard
+    with pytest.raises(ValueError):
+        solvers.shrink(Ct, 1.5)
+
+
+# --------------------------------------------------------------------------------------
+# kron_woodbury_predict / kron_woodbury_inpaint (moved from the deleted test_workflows)
+# --------------------------------------------------------------------------------------
+def test_kron_woodbury_selftest():
+    """kron_woodbury_predict matches the dense Kronecker Wiener mean for full-rank and
+    low-rank cores; kron_woodbury_inpaint fills flagged pixels (incl. a fully-flagged
+    channel) on complex data and leaves good pixels untouched."""
+    Nt, Nf, b = 6, 5, 4
+    P, F = _hpd(Nt, False, 1), _hpd(Nf, False, 2)
+    noise = 0.1 + torch.rand(b, Nt, Nf, dtype=DOUBLE)
+    y = _vec((b, Nt, Nf), False, 3)
+
+    # full-rank cores -> exact match to the dense Kronecker solve
+    m = solvers.kron_woodbury_predict(P, F, noise, y, rcond=1e-15)
+    ref = torch.stack([_dense_wiener(P, F, noise[i], y[i]) for i in range(b)])
+    assert torch.isfinite(m).all()
+    assert (m - ref).abs().max() < 1e-9
+
+    # low-rank cores (rank 2 (x) rank 3) -> still exact for the low-rank Ks
+    Plr = _vec((Nt, 2), False, 4); Plr = Plr @ Plr.T
+    Flr = _vec((Nf, 3), False, 5); Flr = Flr @ Flr.T
+    m2 = solvers.kron_woodbury_predict(Plr, Flr, noise, y, rcond=1e-12)
+    ref2 = torch.stack([_dense_wiener(Plr, Flr, noise[i], y[i]) for i in range(b)])
+    assert (m2 - ref2).abs().max() < 1e-7
+
+    # complex inpaint wrapper: fills flags (real cov split == complex solve), good untouched
+    data = _vec((b, Nt, Nf), True, 6)
+    flags = torch.rand(b, Nt, Nf) < 0.25
+    flags[:, :, 2] = True                                    # all-times-flagged channel
+    var = 0.05 ** 2 * torch.ones(b, Nt, Nf, dtype=DOUBLE)
+    out = solvers.kron_woodbury_inpaint(data, flags, P, F, var, rcond=1e-15)
+
+    nz = var.clone(); nz[flags] = 1e12
+    Ksc = _kron_dense(P, F).to(CDOUBLE)                       # promote real cov -> complex solve
+    ref_c = torch.stack([
+        (Ksc @ torch.linalg.solve(Ksc + torch.diag(nz[i].reshape(-1).to(CDOUBLE)),
+                                  data[i].reshape(-1))).reshape(Nt, Nf) for i in range(b)])
+    assert torch.allclose(out, torch.where(flags, ref_c, data), atol=1e-7)
+    assert torch.allclose(out[~flags], data[~flags])         # good pixels untouched
+    assert (out[:, :, 2].abs() > 1e-9).all()                 # all-flagged channel filled
