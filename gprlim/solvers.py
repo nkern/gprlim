@@ -36,7 +36,6 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 from linear_operator import LinearOperator, to_linear_operator
 from linear_operator.operators import (
-    DiagLinearOperator,
     TriangularLinearOperator,
     KroneckerProductTriangularLinearOperator,
 )
@@ -67,58 +66,47 @@ def promote_like(a, ref):
     return a.to(ref.dtype) if (ref.is_complex() and not a.is_complex()) else a
 
 
-def shrink(C, rcond):
+def truncate(C, rcond):
     r"""
-    Cap a covariance's effective dynamic range by shrinking it toward its diagonal.
+    Low-rank-truncate a Hermitian-PSD covariance via its eigendecomposition.
 
-    Blends ``C`` toward ``diag(C)`` by a variance-preserving convex amount ``eta``,
+    Reconstructs ``C`` from only the eigenmodes whose eigenvalue exceeds ``rcond * lambda_max``,
+    dropping the rest to exactly zero (a truncated eigendecomposition / pinv-style cutoff):
 
-        C_eff = (1 - eta) * C + eta * diag(C),
+        C_trunc = Q diag(lambda_i * [lambda_i >= rcond * lambda_max]) Q^H.
 
-    with ``eta`` chosen so the result has condition number ``cond(C_eff) = 1 / rcond`` -- i.e.
-    the eigenvalues are floored at ``rcond * lambda_max(C)`` while the diagonal (marginal
-    variance) is preserved. ``rcond`` is the usual relative cutoff of ``numpy``/``torch``
-    ``pinv`` (``rcond = 1 / kappa`` for a target condition number ``kappa``).
-
-    For a stationary ``C`` (constant diagonal ``sigma^2``) this is exact: ``diag(C) = sigma^2 I``,
-    so ``C_eff`` has eigenvalues ``(1 - eta) lambda_i + eta sigma^2`` and the dead-mode floor
-    ``eta sigma^2 = rcond * lambda_max`` fixes
-
-        eta = peakedness * rcond,    peakedness = lambda_max(C) / mean(diag(C)).
-
-    In the 2D joint solve this is applied to the time factor ``Ct``: capping its dynamic range
-    caps the spread of the per-time-mode delay cutoffs, reducing spectral leakage to high delay.
-    Because ``peakedness`` absorbs the kernel's amplitude / shape / size (and is split- and
-    scale-invariant), one ``rcond`` (~ the trusted dynamic range / SNR^2) transfers across
-    kernels and baselines, unlike a raw blend fraction. See [[joint-eta-delay-confinement]].
+    ``rcond`` is the usual relative cutoff of ``numpy``/``torch`` ``pinv``. This is the
+    *opposite* of shrinking toward the diagonal: rather than lifting the small eigenvalues to a
+    floor (which would give them nonzero Wiener gain), it removes them. In the 2D joint solve,
+    applied to the time factor ``Ct`` this keeps only the leading (smooth) time modes -- which
+    both *lowers* high-delay leakage (the dropped fast-time modes were the ones coupling into
+    the frequency kernel's out-of-band ripple) and *shrinks* the CG problem (fewer Kronecker
+    modes above the noise -> faster convergence). See [[joint-eta-delay-confinement]].
 
     Parameters
     ----------
     C : tensor or LinearOperator
-        Hermitian-PSD covariance of shape (..., n, n); a dense tensor or a ``LinearOperator``
-        (the same kind is returned). ``lambda_max`` is found via a dense ``eigvalsh`` (``C`` is
-        a small per-axis factor, so a ``LinearOperator`` is densified only for that scalar).
+        Hermitian-PSD covariance of shape (..., n, n); a ``LinearOperator`` is densified for the
+        eigendecomposition (``C`` is a small per-axis factor). Returns a dense tensor.
     rcond : float or None
-        Relative eigenvalue floor in (0, 1]; ``cond(C_eff) = 1 / rcond``. ``0`` / ``None`` is a
-        no-op (returns ``C`` unchanged); ``rcond = 1`` -> pure diagonal (maximal shrink).
+        Relative eigenvalue cutoff in (0, 1]: keep modes with ``lambda >= rcond * lambda_max``.
+        ``0`` / ``None`` is a no-op (returns ``C`` unchanged); ``rcond = 1`` keeps only the
+        leading mode (maximal truncation).
 
     Returns
     -------
-    tensor or LinearOperator
-        The shrunk covariance ``C_eff`` (same kind as ``C``).
+    tensor
+        The truncated covariance ``C_trunc`` (rank = number of kept modes).
     """
     if not rcond:                                 # 0 / 0.0 / None -> unchanged
         return C
     if not 0.0 < rcond <= 1.0:
         raise ValueError(f"rcond must be in (0, 1], got {rcond}")
-    diag = C.diagonal(dim1=-2, dim2=-1)           # marginal variances, (..., n)
     dense = C.to_dense() if isinstance(C, LinearOperator) else C
-    lam_max = torch.linalg.eigvalsh(dense).amax(-1)               # (...,)
-    eta = (lam_max / diag.real.mean(-1) * rcond).clamp(max=1.0)   # peakedness * rcond, capped at 1
-    if isinstance(C, LinearOperator):
-        e = float(eta)                            # lazy path: the non-batched (2D) case
-        return C * (1.0 - e) + DiagLinearOperator(e * diag)
-    return (1.0 - eta[..., None, None]) * C + torch.diag_embed(eta[..., None] * diag)
+    w, Q = torch.linalg.eigh(dense)               # ascending real eigenvalues; w[..., -1] = lam_max
+    keep = w >= rcond * w[..., -1:]               # drop modes (incl. numerical negatives) below cutoff
+    wk = torch.where(keep, w, torch.zeros_like(w))
+    return (Q * wk.unsqueeze(-2)) @ Q.conj().transpose(-1, -2)   # Q diag(wk) Q^H
 
 
 # --------------------------------------------------------------------------------------
@@ -313,7 +301,8 @@ def kron_matvec(Ct, Cf, diag=None):
     return mv
 
 
-def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=None, n_threads=1):
+def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=None, n_threads=1,
+                   return_alpha=False):
     r"""
     Complex Wiener posterior mean  ``m = (Ct (x) Cf) (Ct (x) Cf + diag(noise))^-1 y``  via
     preconditioned CG: structured throughout (never densifies the ``(Ntimes*Nfreqs)^2``
@@ -347,11 +336,15 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
         baseline axis is the efficient place to parallelize and this stops PyTorch's own BLAS
         threading from oversubscribing the cores against the pool. 1 = serial (default), k = k
         threads, -1 = one per CPU. Capped at the batch size.
+    return_alpha : bool, optional
+        If True, return the solved coefficients ``alpha = (Ks + diag(noise))^-1 y`` instead of
+        the mean ``Ks alpha`` (so the caller can apply a cross-covariance to predict at new
+        points). Same shape as ``y``.
 
     Returns
     -------
     m : tensor
-        Posterior mean, shape (..., Ntimes, Nfreqs).
+        Posterior mean, shape (..., Ntimes, Nfreqs) (or ``alpha`` if ``return_alpha``).
     info : dict
         CG diagnostics; for a parallel run, the worst (max) ``iters`` / ``resid`` over chunks.
     """
@@ -374,7 +367,8 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
         # and `tol` is independent of the flag-var/noise ratio.
         a, inf = pcg(kron_matvec(Ct, Cf, diag=nf), yf, M=M, tol=tol, max_iter=max_iter, x0=xf,
                      weight=nf.reciprocal())
-        return kron_matvec(Ct, Cf)(a), inf
+        # return alpha = (Ks+N)^-1 y (for prediction at new points) or the mean Ks alpha
+        return (a if return_alpha else kron_matvec(Ct, Cf)(a)), inf
 
     # number of independent right-hand sides (e.g. baselines) on the leading axis
     B = y_f.shape[0] if y_f.dim() > 1 else 1
@@ -406,7 +400,7 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
 # --------------------------------------------------------------------------------------
 # batched Kronecker-Woodbury direct solve
 # --------------------------------------------------------------------------------------
-def kron_woodbury_predict(Ct, Cf, noise, y, rcond=1e-12):
+def kron_woodbury_predict(Ct, Cf, noise, y, rcond=1e-12, return_alpha=False):
     r"""
     Batched Wiener posterior mean ``m_b = Ks (Ks + diag(noise_b))^-1 y_b`` for a
     Kronecker signal covariance ``Ks = Ct (x) Cf``, without ever forming the
@@ -440,11 +434,15 @@ def kron_woodbury_predict(Ct, Cf, noise, y, rcond=1e-12):
         leading axis batches over baselines); flagged pixels carry a large variance.
     rcond : float
         Relative eigenvalue cutoff for each kernel's low-rank factor.
+    return_alpha : bool
+        If True, return the solved coefficients ``alpha = (Ks + diag(noise))^-1 y`` instead of
+        the mean ``Ks alpha`` -- so the caller can apply a different output operator (e.g. a
+        cross-covariance to predict at new points). Same shape as ``y``.
 
     Returns
     -------
     tensor
-        Posterior mean, shape ``(b, Ntimes, Nfreqs)``.
+        Posterior mean ``(b, Ntimes, Nfreqs)`` (or ``alpha`` if ``return_alpha``).
     """
     # common dtype so a complex kernel (CarrierKernel time axis -> improper / asymmetric-
     # PSD signal) and a real kernel (real freq axis) compose; a complex Hermitian Ct then
@@ -479,6 +477,8 @@ def kron_woodbury_predict(Ct, Cf, noise, y, rcond=1e-12):
     z = torch.cholesky_solve(r, L).reshape(-1, rt, rf)
     Uz = torch.einsum('ti,bij,fj->btf', Ut, z, Uf)
     alpha = d * (y - Uz)
+    if return_alpha:                                                 # for prediction at new points
+        return alpha
 
     # posterior mean  m_b = Ks alpha_b = U (U^H alpha_b)
     rr = torch.einsum('ti,btf,fj->bij', Ut.conj(), alpha, Uf.conj())

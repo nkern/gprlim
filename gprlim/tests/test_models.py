@@ -30,7 +30,7 @@ from gprlim.models import (
     fit_axis_kernel,
     fit_kernel,
 )
-from gprlim.solvers import shrink
+from gprlim.solvers import truncate
 
 
 # The library is functional (no GPModel); this minimal ExactGP exists ONLY here, as the
@@ -341,7 +341,7 @@ def test_posterior_mean_1d():
 def test_posterior_mean_2d():
     """posterior_mean_2d (full 2D posterior mean on the grid, no flags) matches a dense
     per-baseline Wiener solve for woodbury/cg/cholesky, complex & real covariances, the
-    C1_rcond time-shrink, and a 2D mean function (mu) + detrend; pred_x raises NotImplementedError."""
+    C1_rcond truncation, and a 2D mean function (mu) + detrend; pred_x raises NotImplementedError."""
     torch.manual_seed(0)
     Nb, N1, N2 = 3, 6, 7
     x1 = torch.linspace(0, 50, N1, dtype=torch.float64)
@@ -374,9 +374,9 @@ def test_posterior_mean_2d():
                                  rcond=1e-12, cg_tol=1e-11, cg_max_iter=3000)
         assert torch.allclose(outr, dense_ref(C1r), atol=1e-6), ('split', method)
 
-    # C1_rcond shrink: matches a dense solve with the shrunk outer factor
+    # C1_rcond truncation: matches a dense solve with the low-rank-truncated outer factor
     out_e = posterior_mean_2d(k1c, k2, x1, x2, y, noise, C1_rcond=1e-2, method='cholesky')
-    assert torch.allclose(out_e, dense_ref(shrink(C1c, 1e-2)), atol=1e-6)
+    assert torch.allclose(out_e, dense_ref(truncate(C1c, 1e-2)), atol=1e-6)
 
     # mu (2D mean fn) + detrend: subtract both before the solve, add both back to the prediction
     muf = lambda a, b: torch.full((a.shape[0], b.shape[0]), 0.3 + 0.2j, dtype=torch.cdouble)
@@ -398,10 +398,36 @@ def test_posterior_mean_2d():
     assert out_p.shape == (N1, N2, Nb)
     assert torch.allclose(out_p, dense_ref(C1c).permute(1, 2, 0), atol=1e-6)
 
-    # prediction at new points not yet supported
+    # prediction at new 2D points: m = (Cp1 (x) Cp2)(Ks+N)^-1 y with cross-covariances Cp,
+    # for all methods, complex (direct) and real (split) covariances, and one-axis prediction
     import pytest
+    px1 = torch.linspace(5, 45, 4, dtype=torch.float64)        # Npred1=4 != N1
+    px2 = torch.linspace(130, 170, 5, dtype=torch.float64)     # Npred2=5 != N2
+    Cp2 = k2(px2[:, None], x2[:, None]).to_dense().detach()
+
+    def dense_pred(C1, Cp1):
+        Ks = torch.kron(C1, C2.to(C1.dtype)).to(torch.cdouble)
+        Kp = torch.kron(Cp1, Cp2.to(Cp1.dtype)).to(torch.cdouble)
+        out = [(Kp @ torch.linalg.solve(Ks + torch.diag(noise[b].reshape(-1).to(torch.cdouble)),
+                                        y[b].reshape(-1))).reshape(4, 5) for b in range(Nb)]
+        return torch.stack(out)
+
+    Cp1c = k1c(px1[:, None], x1[:, None]).to_dense().detach()
+    ref_pc = dense_pred(C1c, Cp1c)
+    for method in ('woodbury', 'cg', 'cholesky'):
+        outp = posterior_mean_2d(k1c, k2, x1, x2, y, noise, pred_x1=px1, pred_x2=px2,
+                                 method=method, rcond=1e-12, cg_tol=1e-11, cg_max_iter=3000)
+        assert outp.shape == (Nb, 4, 5), (method, outp.shape)
+        assert torch.allclose(outp, ref_pc, atol=1e-6), method
+    # real covariance (split path) predicts too
+    Cp1r = k1r(px1[:, None], x1[:, None]).to_dense().detach()
+    outr = posterior_mean_2d(k1r, k2, x1, x2, y, noise, pred_x1=px1, pred_x2=px2, method='cholesky')
+    assert torch.allclose(outr, dense_pred(C1r, Cp1r), atol=1e-6)
+    # one axis only (pred_x2=None) -> (Nb, Npred1, N2)
+    assert posterior_mean_2d(k1c, k2, x1, x2, y, noise, pred_x1=px1, method='cholesky').shape == (Nb, 4, N2)
+    # pred + C1_rcond truncation is not supported
     with pytest.raises(NotImplementedError):
-        posterior_mean_2d(k1c, k2, x1, x2, y, noise, pred_x1=x1)
+        posterior_mean_2d(k1c, k2, x1, x2, y, noise, pred_x1=px1, C1_rcond=1e-2)
 
 
 def test_posterior_mean_broadcasts_noise():
@@ -592,6 +618,37 @@ def test_posterior_draws_1d_moments():
     assert (Ci - Cpost_r.real).abs().max() / Cpost_r.abs().max() < 0.06
 
 
+def test_2d_dims_forwarding():
+    """inpaint_2d and posterior_draws_2d forward `dims` to posterior_mean_2d: with the two GP
+    axes permuted off the trailing positions, the result equals the default-layout result
+    permuted (same shape, same values)."""
+    torch.manual_seed(0)
+    Nb, N1, N2 = 3, 5, 6
+    x1 = torch.linspace(0, 50, N1, dtype=torch.float64)
+    x2 = torch.linspace(120, 180, N2, dtype=torch.float64)
+    k1 = kernels.CarrierKernel(kernels.ScaleKernel(kernels.RBFKernel()), tau=0.05).double()
+    k1.base_kernel.base_kernel.lengthscale = 8.0
+    k2 = kernels.ScaleKernel(kernels.SincKernel()).double(); k2.base_kernel.lengthscale = 2.0
+    y = torch.randn(Nb, N1, N2, dtype=torch.cdouble)
+    nz = 0.1 + torch.rand(Nb, N1, N2, dtype=torch.float64)
+    fl = torch.zeros(Nb, N1, N2, dtype=bool); fl[:, :, 3] = True; fl[0, 2, 1] = True
+    yp, nzp, flp = (t.permute(1, 2, 0).contiguous() for t in (y, nz, fl))   # (N1, N2, Nb)
+
+    # inpaint_2d: dims=(0,1) on the permuted layout == default result, permuted
+    inp0, mdl0 = inpaint_2d(k1, k2, x1, x2, y, nz, fl, method='cholesky')
+    inpP, mdlP = inpaint_2d(k1, k2, x1, x2, yp, nzp, flp, dims=(0, 1), method='cholesky')
+    assert inpP.shape == (N1, N2, Nb)
+    assert torch.allclose(inpP, inp0.permute(1, 2, 0), atol=1e-9)
+    assert torch.allclose(mdlP, mdl0.permute(1, 2, 0), atol=1e-9)
+
+    # posterior_draws_2d: same RNG seed -> identical draws up to the layout permutation
+    gen = lambda: torch.Generator().manual_seed(7)
+    d0 = posterior_draws_2d(k1, k2, x1, x2, y, nz, size=4, method='cholesky', generator=gen())
+    dP = posterior_draws_2d(k1, k2, x1, x2, yp, nzp, size=4, dims=(0, 1), method='cholesky', generator=gen())
+    assert dP.shape == (4, N1, N2, Nb)
+    assert torch.allclose(dP, d0.permute(0, 2, 3, 1), atol=1e-9)
+
+
 def test_posterior_draws_2d_mean():
     """2D Matheron draws: empirical mean reproduces posterior_mean_2d (complex C1, real C2)."""
     torch.manual_seed(0)
@@ -660,6 +717,69 @@ def test_fit_axis_kernel():
     fit_kernel(kref, x[None, :, None], ys, nzs, Niter=15, opt='Adam', method='cholesky')
     assert torch.allclose(kfit.base_kernel.lengthscale, kref.base_kernel.lengthscale, atol=1e-6)
     assert torch.allclose(kfit.outputscale, kref.outputscale, atol=1e-6)
+
+
+def test_fit_axis_kernel_multidim():
+    """fit_axis_kernel accepts multi-dim inputs and flattens the non-`dim` axes into pooled
+    rows (like posterior_mean_1d) -- the result equals the manually-reshaped 2D call, for the
+    trailing freq axis (dim=-1) and a non-trailing time axis (dim=1)."""
+    torch.manual_seed(0)
+    Nb, Nt, Nf = 3, 5, 16
+    nu = torch.linspace(120, 180, Nf, dtype=torch.float64)
+    t = torch.linspace(0, 200, Nt, dtype=torch.float64)
+    ktrue = kernels.ScaleKernel(kernels.RBFKernel()).double(); ktrue.base_kernel.lengthscale = 3.0
+    g = torch.Generator().manual_seed(0)
+    data = torch.complex(prior_draws_1d(ktrue, nu, size=Nb * Nt, generator=g),
+                         prior_draws_1d(ktrue, nu, size=Nb * Nt, generator=g)).reshape(Nb, Nt, Nf)
+    flags = torch.zeros(Nb, Nt, Nf, dtype=bool)
+    noise = 0.01 * torch.ones(Nb, Nt, Nf, dtype=torch.float64)
+
+    def fresh():
+        k = kernels.ScaleKernel(kernels.RBFKernel()).double(); k.base_kernel.lengthscale = 1.0
+        return k
+
+    # dim=-1 (freq): 3D cube == manual reshape to (Nb*Nt, Nf)
+    kA = fresh(); fit_axis_kernel(data, flags, noise, nu, kA, dim=-1, nsamp=10_000, iters=12, opt='Adam')
+    kB = fresh(); fit_axis_kernel(data.reshape(-1, Nf), flags.reshape(-1, Nf), noise.reshape(-1, Nf),
+                                  nu, kB, nsamp=10_000, iters=12, opt='Adam')
+    assert torch.allclose(kA.base_kernel.lengthscale, kB.base_kernel.lengthscale, atol=1e-10)
+
+    # dim=1 (time, non-trailing): 3D cube == manual movedim+reshape to (Nb*Nf, Nt)
+    kC = fresh(); fit_axis_kernel(data, flags, noise, t, kC, dim=1, nsamp=10_000, iters=12, opt='Adam')
+    kD = fresh(); fit_axis_kernel(data.movedim(1, -1).reshape(-1, Nt),
+                                  flags.movedim(1, -1).reshape(-1, Nt),
+                                  noise.movedim(1, -1).reshape(-1, Nt), t, kD,
+                                  nsamp=10_000, iters=12, opt='Adam')
+    assert torch.allclose(kC.base_kernel.lengthscale, kD.base_kernel.lengthscale, atol=1e-10)
+
+
+def test_fit_axis_kernel_complex_cov():
+    """A complex (Hermitian) covariance couples real & imag, so fit_axis_kernel must NOT stack
+    real/imag -- it fits the complex data directly (also exercises fit_kernel on complex data).
+    Equivalent to fit_kernel on the complex rows."""
+    torch.manual_seed(0)
+    Nrows, Nx = 24, 14
+    x = torch.linspace(0, 100, Nx, dtype=torch.float64)
+    g = torch.Generator().manual_seed(0)
+    kdraw = kernels.CarrierKernel(kernels.ScaleKernel(kernels.RBFKernel()), tau=0.02).double()
+    kdraw.base_kernel.base_kernel.lengthscale = 20.0
+    data = prior_draws_1d(kdraw, x, size=Nrows, generator=g)        # complex (circular) draws
+    flags = torch.zeros(Nrows, Nx, dtype=bool)
+    noise = 0.01 * torch.ones(Nrows, Nx, dtype=torch.float64)
+
+    def fresh():
+        k = kernels.CarrierKernel(kernels.ScaleKernel(kernels.RBFKernel()), tau=0.02).double()
+        k.base_kernel.base_kernel.lengthscale = 5.0
+        return k
+
+    kA = fresh()
+    fit_axis_kernel(data, flags, noise, x, kA, nsamp=10_000, iters=10, opt='Adam')
+    # complex cov -> data kept complex (no stack) -> equals fit_kernel on the complex rows
+    kB = fresh()
+    fit_kernel(kB, x[None, :, None], data, noise, Niter=10, opt='Adam', method='cholesky')
+    assert torch.allclose(kA.base_kernel.base_kernel.lengthscale,
+                          kB.base_kernel.base_kernel.lengthscale, atol=1e-10)
+    assert torch.allclose(kA.base_kernel.outputscale, kB.base_kernel.outputscale, atol=1e-10)
 
 
 def _load(nbls=3, ntimes=48, fslice=slice(None)):

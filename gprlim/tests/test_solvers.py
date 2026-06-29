@@ -252,12 +252,13 @@ def test_kronecker_kernel_cholesky(cplx):
 
 
 # --------------------------------------------------------------------------------------
-# shrink: variance-preserving shrinkage of a covariance toward its diagonal
+# truncate: low-rank truncated-eigendecomposition reconstruction of a covariance
 # --------------------------------------------------------------------------------------
 @pytest.mark.parametrize("cplx", [False, True])
-def test_shrink(cplx):
-    """shrink(C, rcond): variance-preserving blend toward diag(C) by eta = peakedness*rcond,
-    capping cond(C_eff) -> 1/rcond. Diagonal preserved; lazy == dense; rcond=1 -> diagonal."""
+def test_truncate(cplx):
+    """truncate(C, rcond): keep eigenmodes with lambda >= rcond*lambda_max, drop the rest to
+    zero (a pinv-style cutoff -- NOT lifting toward a floor). Hermitian PSD preserved; rank =
+    #kept; lazy == dense; rcond=1 -> rank 1."""
     torch.manual_seed(0)
     n = 8
     t = torch.linspace(0, 20, n, dtype=DOUBLE)
@@ -266,38 +267,31 @@ def test_shrink(cplx):
         k.base_kernel.base_kernel.lengthscale = 5.0
     else:
         k = kernels.ScaleKernel(kernels.RBFKernel()).double(); k.base_kernel.lengthscale = 5.0
-    C = k(t[:, None]).to_dense().detach()                       # stationary, rank-deficient
+    C = k(t[:, None]).to_dense().detach()                       # smooth, rank-deficient
 
     # rcond=0 / None are no-ops (same object)
-    assert solvers.shrink(C, 0.0) is C
-    assert solvers.shrink(C, None) is C
+    assert solvers.truncate(C, 0.0) is C
+    assert solvers.truncate(C, None) is C
 
-    peak = torch.linalg.eigvalsh(C).amax() / C.diagonal().real.mean()    # lambda_max / mean(diag)
-    off = ~torch.eye(n, dtype=bool)
-    for rcond in (1e-4, 1e-2):
-        S = solvers.shrink(C, rcond)
-        eta = float((peak * rcond).clamp(max=1.0))             # the internally-fit blend fraction
-        assert torch.allclose(S.diagonal(), C.diagonal())                  # marginal variance kept
-        assert torch.allclose(S[off], (1.0 - eta) * C[off])                # off-diagonals scaled
-        assert torch.allclose(S, (1.0 - eta) * C + torch.diag_embed(eta * C.diagonal()))
+    w, Q = torch.linalg.eigh(C)
+    for rcond in (1e-3, 1e-1, 1.0):
+        S = solvers.truncate(C, rcond)
+        keep = w >= rcond * w[-1]                                           # modes kept
+        expected = (Q * torch.where(keep, w, torch.zeros_like(w))) @ Q.conj().T
+        assert torch.allclose(S, expected, atol=1e-10)                      # the truncated recon
+        assert torch.allclose(S, S.conj().transpose(-1, -2))               # Hermitian preserved
+        evS = torch.linalg.eigvalsh(S)
+        assert int((evS > 1e-9 * evS.amax()).sum()) == int(keep.sum())     # rank = #kept (dropped->0)
+        assert evS.amin() > -1e-9                                           # PSD, no lifted floor
+    assert int((torch.linalg.eigvalsh(solvers.truncate(C, 1.0)) > 1e-9).sum()) == 1   # rcond=1 -> rank 1
 
-    # headline property: rcond floors the spectrum -> cond(C_eff) ~ 1/rcond (in the regime
-    # where the floor binds, i.e. lambda_min(C)/lambda_max(C) << rcond; small (1-eta) bias)
-    ev = torch.linalg.eigvalsh(solvers.shrink(C, 1e-2))
-    assert abs((ev.amax() / ev.amin()).item() * 1e-2 - 1.0) < 0.08
-
-    # rcond=1 -> pure diagonal (eta clamps to 1, since peakedness >= 1)
-    assert torch.allclose(solvers.shrink(C, 1.0), torch.diag_embed(C.diagonal()))
-
-    # lazy operator in -> operator out, same values as the dense path
+    # lazy operator in -> dense out, same values as the dense path
     op = solvers.to_linear_operator(C)
-    Sl = solvers.shrink(op, 1e-2)
-    assert hasattr(Sl, "to_dense")
-    assert torch.allclose(Sl.to_dense(), solvers.shrink(C, 1e-2))
+    assert torch.allclose(solvers.truncate(op, 1e-2), solvers.truncate(C, 1e-2))
 
     # out-of-range guard
     with pytest.raises(ValueError):
-        solvers.shrink(C, 1.5)
+        solvers.truncate(C, 1.5)
 
 
 # --------------------------------------------------------------------------------------

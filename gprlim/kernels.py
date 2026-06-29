@@ -8,15 +8,9 @@ from linear_operator import to_linear_operator
 from linear_operator.operators import LinearOperator, KroneckerProductLinearOperator
 from torch import Tensor
 
-import gpytorch
-from gpytorch.constraints import Interval, Positive, GreaterThan
-from gpytorch.distributions import MultivariateNormal
-from gpytorch.lazy import LazyEvaluatedKernelTensor
-from gpytorch.likelihoods import GaussianLikelihood, FixedNoiseGaussianLikelihood
-from gpytorch.module import Module
+from gpytorch.constraints import Interval, Positive
 from gpytorch.priors import Prior, LogNormalPrior, NormalPrior
-from gpytorch.kernels import RBFKernel, MaternKernel, ScaleKernel, Kernel, ConstantKernel
-from gpytorch.models import ExactGP
+from gpytorch.kernels import RBFKernel, ScaleKernel, Kernel
 from gpytorch.means import ConstantMean
 
 from . import utils
@@ -1282,7 +1276,7 @@ def default_time_kernel(
 
 def default_freq_kernel(
     bl_vec, buffer=0.0, min_delay=50.0, ml_scale=1e2, pf_scale=1e-1, wd_scale=1e-2, lk_scale=1e-3,
-    only_amp=True, only_global_amp=False, real=True):
+    lk_kern='sinc', only_amp=True, only_global_amp=False, real=True):
     r"""
     Default frequency kernel composed of
 
@@ -1323,6 +1317,8 @@ def default_freq_kernel(
         Scaling of full horizon wedge *relative* to main-lobe scale
     lk_scale : float, optional
         Scaling of supra-horizon leakage *relative* to main-lobe scale
+    lk_kern : str, optional
+        Kernel for the leakage term: ['sinc', 'rbf'] (default: 'sinc').
     only_amp : bool, optional
         If True (default) freeze every shape parameter (all lengthscales and
         carrier taus), leaving only the amplitudes (outputscales) free to fit.
@@ -1404,9 +1400,15 @@ def default_freq_kernel(
     wedge.base_kernel.lengthscale = ls_wedge
     wedge.outputscale = wd_scale
 
-    ## 4. Supra-horizon leakage: wider real Sinc brick-wall over +/- (horizon + buffer)
+    ## 4. Supra-horizon leakage: wider real Sinc / RBF over +/- (horizon + buffer)
+    if lk_kern.lower() == 'sinc':
+        _kern = SincKernel
+    elif lk_kern.lower() == 'rbf':
+        _kern = RBFKernel
+    else:
+        raise ValueError("lk_kern must be in ['sinc', 'rbf']")
     supra_k = ScaleKernel(
-        SincKernel(lengthscale_constraint=Interval(ls_supra * 0.8, ls_supra * 1.2),
+        _kern(lengthscale_constraint=Interval(ls_supra * 0.8, ls_supra * 1.2),
                    lengthscale_prior=LogNormalPrior(np.log(ls_supra), 0.3)),
         outputscale_constraint=Interval(1e-6, 1e4),
         outputscale_prior=LogNormalPrior(np.log(lk_scale), 5.0),

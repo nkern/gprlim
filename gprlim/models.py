@@ -2,8 +2,8 @@ import math
 
 import torch
 
-from .solvers import (stack_ri, unstack_ri, promote_like, shrink, kron_cholesky,
-                      gpr_invert, woodbury_batched, cholesky_batched,
+from .solvers import (stack_ri, unstack_ri, promote_like, truncate, kron_cholesky,
+                      gpr_invert, cholesky_batched,
                       kron_woodbury_predict, kron_wiener_cg)
 
 
@@ -138,12 +138,15 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
     noise : tensor
         Per-pixel noise variance, must broadcast with ``y``; flags should be a large value.
     pred_x1, pred_x2 : tensor, optional
-        Prediction grids. NOT YET IMPLEMENTED -- pass None (predict on the (x1, x2) grid).
+        Prediction grids (Npred1,), (Npred2,); the cross-covariances ``C1(pred_x1, x1)`` and
+        ``C2(pred_x2, x2)`` are applied to the solved coefficients to predict at new points
+        (either axis independently; default predicts on the (x1, x2) grid). Not supported
+        together with ``C1_rcond`` (truncation applies to the training block only).
     C1_rcond : float, optional
-        Relative eigenvalue floor in (0, 1] applied to the outer factor ``C1`` to cap its
-        dynamic range to ``cond = 1 / C1_rcond`` (see :func:`gprlim.solvers.shrink`) -- the
-        time-decorrelation knob that confines spectral leakage to high delay. Default None
-        (no shrink). ``C1_rcond = 1 / kappa`` for a target condition number ``kappa``.
+        Relative eigenvalue cutoff in (0, 1] for a low-rank truncation of the outer factor
+        ``C1`` (keep modes with ``lambda >= C1_rcond * lambda_max``, drop the rest; see
+        :func:`gprlim.solvers.truncate`). Keeping only the leading (smooth) time modes lowers
+        high-delay leakage and speeds CG. Default None (full joint, no truncation).
     method : str
         'woodbury' (default; low-rank, rank-truncated at ``rcond``), 'cg' (preconditioned CG,
         to ``cg_tol``, parallelized over the batch by ``n_threads``), or 'cholesky' (densify
@@ -160,14 +163,17 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
     Returns
     -------
     tensor
-        Posterior mean, shape (Nbatch, Nx1, Nx2).
+        Posterior mean, shape (Nbatch, Nx1, Nx2) (or (Nbatch, Npred1, Npred2) for pred grids).
     """
-    if pred_x1 is not None or pred_x2 is not None:
-        raise NotImplementedError("prediction at new 2D points is not yet implemented; pass "
-                                  "pred_x1=pred_x2=None for the posterior mean on the grid.")
+    new_points = pred_x1 is not None or pred_x2 is not None
+    if new_points and C1_rcond:
+        raise NotImplementedError("pred_x1/pred_x2 with C1_rcond truncation is not supported "
+                                  "(truncation applies only to the training block).")
     x1 = torch.as_tensor(x1).reshape(-1)
     x2 = torch.as_tensor(x2).reshape(-1)
     Nx1, Nx2 = x1.shape[-1], x2.shape[-1]
+    gx1 = x1 if pred_x1 is None else torch.as_tensor(pred_x1).reshape(-1)
+    gx2 = x2 if pred_x2 is None else torch.as_tensor(pred_x2).reshape(-1)
 
     # move the two sample axes to the last two and flatten the rest into one batch; noise is
     # broadcast to y's shape first (so a shared (1, ...) / lower-rank noise lines up per row)
@@ -178,20 +184,23 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
     nf = noise.movedim(dims, (-2, -1)).reshape(-1, Nx1, Nx2)
 
     with torch.no_grad():
-        # optional 2D mean function, then optional inverse-noise-weighted detrend; both are
-        # subtracted before the (zero-mean) Wiener solve and added back to the prediction.
-        # (pred grid == train grid until pred_x1/pred_x2 are implemented, so mu reused below.)
+        # mean function: subtract at the training grid, add back at the prediction grid; then
+        # optional inverse-noise-weighted detrend (a per-row offset, restored after the solve).
         mu_x = 0.0 if mu is None else mu(x1[:, None], x2[:, None])
+        mu_pred = mu_x if not new_points else (0.0 if mu is None else mu(gx1[:, None], gx2[:, None]))
         yc = yf - mu_x
         trend = 0.0
         if detrend:
             trend = mean_center(yc, nf, dim=(-2, -1))
             yc = yc - trend
 
-        # dense per-axis factors (the (Nx1*Nx2)^2 covariance is never formed)
-        # cap C1's dynamic range (no-op if C1_rcond is None): decorrelates the outer axis
-        C1 = shrink(kernel1(x1[:, None]).to_dense().detach(), C1_rcond)
+        # dense per-axis training factors (the (Nx1*Nx2)^2 covariance is never formed); low-rank
+        # truncate C1 (no-op if C1_rcond is None) -- keeps the leading time modes. Bp1/Bp2 are
+        # the output operators: training covariances (predict on the grid) or cross-covariances.
+        C1 = truncate(kernel1(x1[:, None]).to_dense().detach(), C1_rcond)
         C2 = kernel2(x2[:, None]).to_dense().detach()
+        Bp1 = C1 if pred_x1 is None else kernel1(gx1[:, None], x1[:, None]).to_dense().detach()
+        Bp2 = C2 if pred_x2 is None else kernel2(gx2[:, None], x2[:, None]).to_dense().detach()
 
         # complex strategy: split real/imag for a real covariance, else solve directly
         # (promoting a real cov to complex for complex data).
@@ -199,26 +208,29 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
         split = yc.is_complex() and not cov_dtype.is_complex
         if yc.is_complex() and not split:
             cov_dtype = torch.promote_types(cov_dtype, yc.dtype)
-        C1, C2 = C1.to(cov_dtype), C2.to(cov_dtype)
+        C1, C2, Bp1, Bp2 = (t.to(cov_dtype) for t in (C1, C2, Bp1, Bp2))
         if split:
             ys, nz = torch.cat([yc.real, yc.imag], 0), torch.cat([nf, nf], 0)
         else:
             ys, nz = yc, nf
 
+        # solve for alpha = (Ks + diag(noise))^-1 ys  (Ks = C1 (x) C2), structured per method
         if method == 'woodbury':
-            mm = kron_woodbury_predict(C1, C2, nz, ys, rcond=rcond)
+            alpha = kron_woodbury_predict(C1, C2, nz, ys, rcond=rcond, return_alpha=True)
         elif method == 'cg':
-            mm, _ = kron_wiener_cg(C1, C2, nz, ys, tol=cg_tol, max_iter=cg_max_iter, n_threads=n_threads)
+            alpha, _ = kron_wiener_cg(C1, C2, nz, ys, tol=cg_tol, max_iter=cg_max_iter,
+                                      n_threads=n_threads, return_alpha=True)
         elif method == 'cholesky':
-            Cs = torch.kron(C1, C2)
             nb = ys.shape[0]
-            mm = gpr_invert(Cs, nz.reshape(nb, -1), B=Cs, y=ys.reshape(nb, -1),
-                            method='cholesky').reshape(nb, Nx1, Nx2)
+            alpha = gpr_invert(torch.kron(C1, C2), nz.reshape(nb, -1), y=ys.reshape(nb, -1),
+                               method='cholesky').reshape(nb, Nx1, Nx2)
         else:
             raise ValueError(f"method must be 'woodbury', 'cg' or 'cholesky', got {method!r}")
 
+        # apply the output operator  m = (Bp1 (x) Bp2) alpha  (rectangular for new points),
         # recombine real/imag, then restore the mean function + detrend offset
-        pred = (unstack_ri(mm) if split else mm) + mu_x + trend
+        mm = torch.einsum('pt,rtf,qf->rpq', Bp1, alpha, Bp2)
+        pred = (unstack_ri(mm) if split else mm) + mu_pred + trend
 
     return pred.reshape(*lead, *pred.shape[-2:]).movedim((-2, -1), dims)
 
@@ -271,7 +283,8 @@ def inpaint_1d(kernel, x, y, noise, flags, mu=None, dim=-1, detrend=False,
 
 
 def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, C1_rcond=None, mu=None, detrend=False,
-               method='woodbury', rcond=1e-12, cg_tol=1e-4, cg_max_iter=5000, n_threads=1):
+               dims=(-2, -1), method='woodbury', rcond=1e-12, cg_tol=1e-4, cg_max_iter=5000,
+               n_threads=1):
     """
     Inpaint ``y`` at flagged pixels with the 2D GP posterior mean (separable ``C1 (x) C2``).
 
@@ -288,23 +301,23 @@ def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, C1_rcond=None, mu=None
     x1, x2 : tensor
         1D grids, shapes (Nx1,), (Nx2,).
     y : tensor
-        Data, shape (Nbatch, Nx1, Nx2) (real or complex).
+        Data, shape (..., Nx1, Nx2) with the two GP axes at ``dims`` (real or complex).
     noise : tensor
         Per-pixel noise variance, must broadcast with ``y``; flagged pixels assumed already
         down-weighted (large variance).
     flags : tensor
-        Boolean mask, same shape as ``y`` (True where flagged).
+        Boolean mask, broadcastable to ``y`` (True where flagged).
     C1_rcond : float, optional
-        Relative eigenvalue floor in (0, 1] on the outer factor ``C1`` (caps its dynamic range
-        to ``cond = 1 / C1_rcond``; the delay-confinement knob -- see
-        :func:`gprlim.solvers.shrink` / :func:`posterior_mean_2d`).
+        Relative eigenvalue cutoff in (0, 1] for a low-rank truncation of the outer factor
+        ``C1`` (keeps the leading time modes; lowers high-delay leakage and speeds CG -- see
+        :func:`gprlim.solvers.truncate` / :func:`posterior_mean_2d`).
     mu : callable, optional
         2D mean function ``mu(x1[:, None], x2[:, None]) -> (..., Nx1, Nx2)``.
     detrend : bool, optional
         Subtract an inverse-noise-weighted mean over the (x1, x2) axes before the solve and
         add it back (see :func:`posterior_mean_2d`).
-    method, rcond, cg_tol, cg_max_iter, n_threads
-        Forwarded to :func:`posterior_mean_2d` (the structured solver).
+    dims, method, rcond, cg_tol, cg_max_iter, n_threads
+        Forwarded to :func:`posterior_mean_2d` (``dims`` = the two GP axes of ``y``).
 
     Returns
     -------
@@ -314,7 +327,7 @@ def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, C1_rcond=None, mu=None
         The full posterior-mean model on the (x1, x2) grid (same shape/dtype as ``y``).
     """
     mdl = posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, C1_rcond=C1_rcond, mu=mu,
-                            detrend=detrend, method=method, rcond=rcond, cg_tol=cg_tol,
+                            detrend=detrend, dims=dims, method=method, rcond=rcond, cg_tol=cg_tol,
                             cg_max_iter=cg_max_iter, n_threads=n_threads)
     return torch.where(flags, mdl, y), mdl
 
@@ -504,7 +517,7 @@ def posterior_draws_1d(kernel, x, y, noise, mu=None, size=1, dim=-1, jitter=1e-1
 
 
 def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, C1_rcond=None,
-                       jitter=1e-10, method='woodbury', rcond=1e-12, cg_tol=1e-4,
+                       dims=(-2, -1), jitter=1e-10, method='woodbury', rcond=1e-12, cg_tol=1e-4,
                        cg_max_iter=5000, n_threads=1, generator=None):
     """
     Draw samples from the separable 2D GP posterior given data ``y`` via Matheron's rule.
@@ -513,7 +526,7 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, C1_r
 
         f_post = f_prior + posterior_mean(y - f_prior - eps),   eps ~ N(0, noise)
 
-    The prior draw uses the structured Kronecker Cholesky of the (``C1_rcond``-shrunk)
+    The prior draw uses the structured Kronecker Cholesky of the (``C1_rcond``-truncated)
     ``C1 (x) C2`` and the correction reuses :func:`posterior_mean_2d`, so the ``(Nx1*Nx2)^2``
     covariance is never formed. Complex data is handled as in :func:`posterior_mean_2d`. A mean
     function ``mu`` is carried by the prior draw (and so appears in the posterior samples).
@@ -526,7 +539,7 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, C1_r
     x1, x2 : tensor
         1D grids, shapes (Nx1,), (Nx2,).
     y : tensor
-        Data, shape (Nbatch, Nx1, Nx2).
+        Data, shape (..., Nx1, Nx2) with the two GP axes at ``dims``.
     noise : tensor
         Per-pixel noise variance, must broadcast with ``y``.
     mu : callable, optional
@@ -535,9 +548,11 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, C1_r
     size : int, optional
         Number of posterior draws. Default 1.
     C1_rcond : float, optional
-        Relative eigenvalue floor in (0, 1] on the outer factor ``C1`` (caps its dynamic range
-        to ``cond = 1 / C1_rcond``; see :func:`gprlim.solvers.shrink`); applied to both the
-        prior draw and the correction.
+        Relative eigenvalue cutoff in (0, 1] for a low-rank truncation of the outer factor
+        ``C1`` (keep modes with ``lambda >= C1_rcond * lambda_max``; see
+        :func:`gprlim.solvers.truncate`); applied to both the prior draw and the correction.
+    dims : tuple, optional
+        The two GP axes of ``y`` (mapped to the last two internally; default (-2, -1)).
     jitter : float, optional
         Relative diagonal jitter for the prior-draw Kronecker Cholesky.
     method, rcond, cg_tol, cg_max_iter, n_threads
@@ -548,53 +563,67 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, C1_r
     Returns
     -------
     tensor
-        Posterior draws of shape (size, Nbatch, Nx1, Nx2).
+        Posterior draws of shape (size, *y.shape).
     """
     x1 = torch.as_tensor(x1).reshape(-1)
     x2 = torch.as_tensor(x2).reshape(-1)
-    n1, n2, Nb = x1.shape[-1], x2.shape[-1], y.shape[0]
+    n1, n2 = x1.shape[-1], x2.shape[-1]
+    # move the two GP axes to the last two and flatten the rest into one batch (noise broadcast
+    # to y first); reverse the move on return -- the prepended size axis shifts non-negative dims
+    yf = y.movedim(dims, (-2, -1))
+    lead = yf.shape[:-2]
+    yf = yf.reshape(-1, n1, n2)
+    nf = torch.broadcast_to(noise, y.shape).movedim(dims, (-2, -1)).reshape(-1, n1, n2)
+    Nb = yf.shape[0]
     with torch.no_grad():
-        C1 = shrink(kernel1(x1[:, None]).to_dense(), C1_rcond)
+        C1 = truncate(kernel1(x1[:, None]).to_dense(), C1_rcond)
         C2 = kernel2(x2[:, None]).to_dense()
         dt = torch.promote_types(C1.dtype, C2.dtype)             # uniform factor dtype
         cov_c = dt.is_complex
-        L = kron_cholesky([C1.to(dt), C2.to(dt)], jitter=jitter)  # chol of shrink(C1) (x) C2
+        L = kron_cholesky([C1.to(dt), C2.to(dt)], jitter=jitter)  # chol of truncate(C1) (x) C2
         z = _conv_normal((size, Nb, n1 * n2), y.is_complex(), cov_c, generator)
         f_prior = _chol_matmul(L, z).reshape(size, Nb, n1, n2)
         if mu is not None:
             f_prior = f_prior + mu(x1[:, None], x2[:, None])     # prior carries the mean
-        eps = noise.sqrt() * _conv_normal((size, Nb, n1, n2), y.is_complex(), cov_c, generator)
-        resid = (y.unsqueeze(0) - f_prior - eps).reshape(size * Nb, n1, n2)
-        nr = noise.unsqueeze(0).expand(size, Nb, n1, n2).reshape(size * Nb, n1, n2)
+        eps = nf.sqrt() * _conv_normal((size, Nb, n1, n2), y.is_complex(), cov_c, generator)
+        resid = (yf.unsqueeze(0) - f_prior - eps).reshape(size * Nb, n1, n2)
+        nr = nf.unsqueeze(0).expand(size, Nb, n1, n2).reshape(size * Nb, n1, n2)
         corr = posterior_mean_2d(kernel1, kernel2, x1, x2, resid, nr, C1_rcond=C1_rcond, method=method,
                                  rcond=rcond, cg_tol=cg_tol, cg_max_iter=cg_max_iter,
                                  n_threads=n_threads).reshape(size, Nb, n1, n2)
-    return f_prior + corr
+        out = (f_prior + corr).reshape(size, *lead, n1, n2)
+    dest = tuple(d + 1 if d >= 0 else d for d in dims)            # +1 for the prepended size axis
+    return out.movedim((-2, -1), dest)
 
 
-def fit_axis_kernel(data, flags, noise, x, kernel, nsamp=512, iters=5,
+def fit_axis_kernel(data, flags, noise, x, kernel, dim=-1, nsamp=512, iters=5,
                     opt='LBFGS', method='cholesky'):
     """
     Fit a kernel's hyperparameters by marginal likelihood along one axis (IN PLACE).
 
-    Pools the rows (real/imag stacked for a real covariance, kept complex for a complex
-    one), drawing the most-complete rows first so a few flagged pixels don't bias the fit;
-    ``nsamp`` caps the fit batch. A thin wrapper over :func:`fit_kernel` for the per-axis
-    inpaint workflow (compose with :func:`inpaint_1d` / :func:`inpaint_2d`).
+    The GP/sample axis of ``data`` is ``dim`` (length ``len(x)``); every other axis is
+    flattened into the pooled rows (so the full (Nbls, Ntimes, Nfreqs) cube can be passed
+    directly -- ``dim=-1`` to fit the frequency kernel, ``dim=1`` the time kernel). Pools the
+    rows (real/imag stacked for a real covariance, kept complex for a complex one), drawing
+    the most-complete rows first so a few flagged pixels don't bias the fit; ``nsamp`` caps the
+    fit batch. A thin wrapper over :func:`fit_kernel` for the per-axis inpaint workflow
+    (compose with :func:`inpaint_1d` / :func:`inpaint_2d`).
 
     Parameters
     ----------
     data : tensor
-        Data rows of shape (Nrows, Nx), real or complex.
+        Data of shape (..., Nx, ...), with the sample axis at ``dim`` (real or complex).
     flags : tensor
-        Boolean flags of shape (Nrows, Nx) (True where flagged); used only to rank rows by
-        completeness for the fit.
+        Boolean flags (True where flagged), broadcastable to ``data``; used only to rank rows
+        by completeness for the fit.
     noise : tensor
-        Noise variance of shape (Nrows, Nx); flagged pixels assumed already down-weighted.
+        Noise variance, broadcastable to ``data``; flagged pixels assumed already down-weighted.
     x : tensor
         Axis grid of shape (Nx,).
     kernel : gpytorch.kernels.Kernel
         Kernel to fit; modified in place and returned.
+    dim : int, optional
+        The sample axis of ``data`` (length ``len(x)``). Default -1.
     nsamp : int, optional
         Maximum number of (most-complete) rows used in the fit.
     iters : int, optional
@@ -609,6 +638,15 @@ def fit_axis_kernel(data, flags, noise, x, kernel, nsamp=512, iters=5,
     gpytorch.kernels.Kernel
         The same ``kernel``, fit in place.
     """
+    # move the sample axis to last and flatten the rest into pooled rows (flags/noise are
+    # broadcast to data's shape first, then reshaped the same way -- like posterior_mean_1d)
+    x = torch.as_tensor(x).reshape(-1)
+    Nx = x.shape[-1]
+    shape = data.shape
+    data = data.movedim(dim, -1).reshape(-1, Nx)
+    flags = torch.broadcast_to(flags, shape).movedim(dim, -1).reshape(-1, Nx)
+    noise = torch.broadcast_to(noise, shape).movedim(dim, -1).reshape(-1, Nx)
+
     # rank rows by completeness, keep the most-complete `nsamp` so a few flagged pixels
     # don't bias the fit (noise already down-weights them; flags only rank here)
     good = 1.0 - flags.float().mean(1)
