@@ -346,9 +346,10 @@ def _draws_from_chol(L, batch, generator=None):
     with ``a, b ~ N(0, 1)`` so ``E[z z^H] = I`` and hence ``E[f f^H] = L L^H``. ``L`` may be a
     dense tensor or a ``LinearOperator``."""
     n = L.shape[-1]
-    a = torch.randn(*batch, n, 1, dtype=torch.float64, generator=generator)
+    rdtype = torch.empty((), dtype=L.dtype).real.dtype     # real-component dtype (real or complex L)
+    a = torch.randn(*batch, n, 1, dtype=rdtype, device=L.device, generator=generator)
     if L.dtype.is_complex:
-        b = torch.randn(*batch, n, 1, dtype=torch.float64, generator=generator)
+        b = torch.randn(*batch, n, 1, dtype=rdtype, device=L.device, generator=generator)
         z = torch.complex(a, b) / 2.0 ** 0.5
     else:
         z = a
@@ -429,15 +430,15 @@ def prior_draws_2d(kernel1, kernel2, x1, x2, mu=None, size=1, jitter=1e-10, gene
         return f if mu is None else f + mu(x1[:, None], x2[:, None])
 
 
-def _conv_normal(shape, data_complex, cov_complex, generator=None):
+def _conv_normal(shape, data_complex, cov_complex, dtype, device, generator=None):
     """Standard normal matching the Wiener-solve complex convention: real (real data);
     circular complex ``z = (a + i b)/sqrt(2)`` with ``E[|z|^2] = 1`` (complex data + complex
     covariance, real/imag coupled); or 'biparte' complex ``z = a + i b`` with real & imag each
     ``N(0,1)`` (complex data + real covariance, where the solve treats each part identically)."""
-    a = torch.randn(*shape, dtype=torch.float64, generator=generator)
+    a = torch.randn(*shape, dtype=dtype, device=device, generator=generator)
     if not data_complex:
         return a
-    z = torch.complex(a, torch.randn(*shape, dtype=torch.float64, generator=generator))
+    z = torch.complex(a, torch.randn(*shape, dtype=dtype, device=device, generator=generator))
     return z / 2.0 ** 0.5 if cov_complex else z
 
 
@@ -505,10 +506,10 @@ def posterior_draws_1d(kernel, x, y, noise, mu=None, size=1, dim=-1, jitter=1e-1
         yp = y.movedim(dim, -1)                                  # sample axis last
         lead = yp.shape[:-1]
         np_ = noise.movedim(dim, -1)
-        f_prior = _chol_matmul(L, _conv_normal((size, *lead, n), y.is_complex(), cov_c, generator))
+        f_prior = _chol_matmul(L, _conv_normal((size, *lead, n), y.is_complex(), cov_c, y.real.dtype, y.device, generator))
         if mu is not None:
             f_prior = f_prior + mu(x[:, None])                   # prior carries the mean
-        eps = np_.sqrt() * _conv_normal((size, *lead, n), y.is_complex(), cov_c, generator)
+        eps = np_.sqrt() * _conv_normal((size, *lead, n), y.is_complex(), cov_c, y.real.dtype, y.device, generator)
         resid = yp.unsqueeze(0) - f_prior - eps                  # (size, *lead, n)
         corr = posterior_mean_1d(kernel, x, resid, np_.unsqueeze(0).expand(size, *np_.shape),
                                  dim=-1, rcond=rcond, method=method, chunk=chunk)
@@ -581,11 +582,11 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, C1_r
         dt = torch.promote_types(C1.dtype, C2.dtype)             # uniform factor dtype
         cov_c = dt.is_complex
         L = kron_cholesky([C1.to(dt), C2.to(dt)], jitter=jitter)  # chol of truncate(C1) (x) C2
-        z = _conv_normal((size, Nb, n1 * n2), y.is_complex(), cov_c, generator)
+        z = _conv_normal((size, Nb, n1 * n2), y.is_complex(), cov_c, y.real.dtype, y.device, generator)
         f_prior = _chol_matmul(L, z).reshape(size, Nb, n1, n2)
         if mu is not None:
             f_prior = f_prior + mu(x1[:, None], x2[:, None])     # prior carries the mean
-        eps = nf.sqrt() * _conv_normal((size, Nb, n1, n2), y.is_complex(), cov_c, generator)
+        eps = nf.sqrt() * _conv_normal((size, Nb, n1, n2), y.is_complex(), cov_c, y.real.dtype, y.device, generator)
         resid = (yf.unsqueeze(0) - f_prior - eps).reshape(size * Nb, n1, n2)
         nr = nf.unsqueeze(0).expand(size, Nb, n1, n2).reshape(size * Nb, n1, n2)
         corr = posterior_mean_2d(kernel1, kernel2, x1, x2, resid, nr, C1_rcond=C1_rcond, method=method,

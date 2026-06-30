@@ -1073,7 +1073,7 @@ class KroneckerKernel(Kernel):
             Optional RNG.
         """
         L = self.cholesky(jitter=jitter)
-        w = torch.randn(*sample_shape, L.shape[-1], 1, dtype=L.dtype, generator=generator)
+        w = torch.randn(*sample_shape, L.shape[-1], 1, dtype=L.dtype, device=L.device, generator=generator)
         return (L @ w).squeeze(-1)
 
     def forward(self, x1, x2, diag=False, last_dim_is_batch=False, **params):
@@ -1220,7 +1220,7 @@ def default_time_kernel(
     fz = ScaleKernel(
         RBFKernel(lengthscale_constraint=Interval(0, 1e4),
                   lengthscale_prior=LogNormalPrior(np.log(1e3), 0.3)),
-        outputscale_constraint=Interval(1e-5, 1e2),
+        outputscale_constraint=Interval(1e-5, 1e3),
         outputscale_prior=LogNormalPrior(np.log(fz_scale), 5.0),
     )
     fz.base_kernel.lengthscale = 1e3  # sec
@@ -1237,7 +1237,7 @@ def default_time_kernel(
     sinc = ScaleKernel(
         SincKernel(lengthscale_constraint=Interval(ls * .8, ls * 1.2),
                    lengthscale_prior=LogNormalPrior(np.log(ls), 0.3)),
-        outputscale_constraint=Interval(1e-5, 1e0),
+        outputscale_constraint=Interval(1e-5, 1e4),
         outputscale_prior=LogNormalPrior(np.log(fr_scale), 5.0)
     )
     sinc.outputscale = fr_scale
@@ -1275,8 +1275,8 @@ def default_time_kernel(
 
 
 def default_freq_kernel(
-    bl_vec, buffer=0.0, min_delay=50.0, ml_scale=1e2, pf_scale=1e-1, wd_scale=1e-2, lk_scale=1e-3,
-    lk_kern='sinc', only_amp=True, only_global_amp=False, real=True):
+    bl_vec, ml_scale=1e2, pf_scale=1e-1, wd_scale=1e-2, lk_scale=1e-3, lk_kern='twinrbf',
+    buffer=125.0, min_delay=50.0, only_amp=True, only_global_amp=False, real=True):
     r"""
     Default frequency kernel composed of
 
@@ -1284,7 +1284,8 @@ def default_freq_kernel(
     2. pitchfork at +/- baseline horizon: a real TwinRBFKernel (``real=True``,
        default) or two CarrierKernel(RBFKernel) (``real=False``)
     3. SincKernel for -horizon < delays < horizon
-    4. SincKernel for supra-horizon leakage
+    4. SincKernel for supra-horizon leakage or a wide
+       TwinRBFKernel at pitchfork delays.
 
     all scaled by a universal ScaleKernel. The output kernel
     mixture takes frequency in MHz.
@@ -1303,12 +1304,6 @@ def default_freq_kernel(
     bl_vec : array-like
         ENU baseline vector(s) in meters, shape (3,) or (Nbls, 3). The horizon
         delay is averaged over baselines if more than one is given.
-    buffer : float, optional
-        Extra delay [ns] added beyond the horizon for the supra-horizon component
-        (4). Default None (-> 0, i.e. component 4 shares component 3's band).
-    min_delay : float, optional
-        Floor [ns] on the horizon delay (short baselines), and the fiducial inner
-        delay scale setting the delay=0 main-lobe and pitchfork widths. Default 50.
     ml_scale : float, optional
         Overall scaling of the main-lobe (and the entire kernel)
     pf_scale : float, optional
@@ -1318,7 +1313,15 @@ def default_freq_kernel(
     lk_scale : float, optional
         Scaling of supra-horizon leakage *relative* to main-lobe scale
     lk_kern : str, optional
-        Kernel for the leakage term: ['sinc', 'rbf'] (default: 'sinc').
+        Kernel for the leakage term: ['sinc', 'twinrbf'] (default: 'sinc').
+        'sinc' : wide sinc spanning +/- horizon + buffer
+        'twinrbf': double RBF at +/- pitchfork delays but with wider lobes
+    buffer : float, optional
+        Extra delay [ns] added beyond the horizon for the supra-horizon component
+        (4). Default None (-> 0, i.e. component 4 shares component 3's band).
+    min_delay : float, optional
+        Floor [ns] on the horizon delay (short baselines), and the fiducial inner
+        delay scale setting the delay=0 main-lobe and pitchfork widths. Default 50.
     only_amp : bool, optional
         If True (default) freeze every shape parameter (all lengthscales and
         carrier taus), leaving only the amplitudes (outputscales) free to fit.
@@ -1364,7 +1367,7 @@ def default_freq_kernel(
                           lengthscale_prior=LogNormalPrior(np.log(ls_main * 3), 0.3),
                           tau_constraint=Interval(horizon * 0.8, horizon * 1.2),
                           tau_prior=NormalPrior(horizon, horizon * 0.01)),
-            outputscale_constraint=Interval(1e-6, 1e2),
+            outputscale_constraint=Interval(1e-6, 1e3),
             outputscale_prior=LogNormalPrior(np.log(pf_scale), 5.0),
         )
         pf.base_kernel.lengthscale = ls_main * 3
@@ -1378,7 +1381,7 @@ def default_freq_kernel(
             horn = ScaleKernel(
                 RBFKernel(lengthscale_constraint=Interval(0, 1e3),
                           lengthscale_prior=LogNormalPrior(np.log(ls_main * 3), 0.3)),
-                outputscale_constraint=Interval(1e-6, 1e2),
+                outputscale_constraint=Interval(1e-6, 1e3),
                 outputscale_prior=LogNormalPrior(np.log(pf_scale), 5.0),
             )
             horn.base_kernel.lengthscale = ls_main * 3
@@ -1394,28 +1397,40 @@ def default_freq_kernel(
     wedge = ScaleKernel(
         SincKernel(lengthscale_constraint=Interval(ls_wedge * 0.8, ls_wedge * 1.2),
                    lengthscale_prior=LogNormalPrior(np.log(ls_wedge), 0.3)),
-        outputscale_constraint=Interval(1e-6, 1e2),
+        outputscale_constraint=Interval(1e-6, 1e4),
         outputscale_prior=LogNormalPrior(np.log(wd_scale), 5.0),
     )
     wedge.base_kernel.lengthscale = ls_wedge
     wedge.outputscale = wd_scale
 
-    ## 4. Supra-horizon leakage: wider real Sinc / RBF over +/- (horizon + buffer)
-    if lk_kern.lower() == 'sinc':
-        _kern = SincKernel
-    elif lk_kern.lower() == 'rbf':
-        _kern = RBFKernel
-    else:
-        raise ValueError("lk_kern must be in ['sinc', 'rbf']")
-    supra_k = ScaleKernel(
-        _kern(lengthscale_constraint=Interval(ls_supra * 0.8, ls_supra * 1.2),
-                   lengthscale_prior=LogNormalPrior(np.log(ls_supra), 0.3)),
-        outputscale_constraint=Interval(1e-6, 1e4),
-        outputscale_prior=LogNormalPrior(np.log(lk_scale), 5.0),
-    )
-    supra_k.base_kernel.lengthscale = ls_supra
-    supra_k.outputscale = lk_scale
+    ## 4. Supra-horizon leakage
+    if lk_kern == 'sinc':
+        # wider real Sinc over +/- (horizon + buffer)
+        supra_k = ScaleKernel(
+            SincKernel(lengthscale_constraint=Interval(ls_supra * 0.8, ls_supra * 1.2),
+                       lengthscale_prior=LogNormalPrior(np.log(ls_supra), 0.3)),
+            outputscale_constraint=Interval(1e-6, 1e4),
+            outputscale_prior=LogNormalPrior(np.log(lk_scale), 5.0),
+        )
+        supra_k.base_kernel.lengthscale = ls_supra
+        supra_k.outputscale = lk_scale
 
+    elif lk_kern == 'twinrbf':
+        # real wider RBF at pitchfork delays: ls is the width, tau is the delay
+        _ls = 1 / (2 * max([buf, 1.0]) * 1e-3)  # ls in MHz
+        supra_k = ScaleKernel(
+            TwinRBFKernel(lengthscale_constraint=Interval(_ls * 0.8, _ls * 1.2),
+                          lengthscale_prior=LogNormalPrior(np.log(_ls), 0.3),
+                          tau_constraint=Interval(horizon * 0.8, horizon * 1.2),
+                          tau_prior=NormalPrior(horizon, horizon * 0.01)),
+            outputscale_constraint=Interval(1e-6, 1e4),
+            outputscale_prior=LogNormalPrior(np.log(lk_scale), 5.0),
+        )
+        supra_k.base_kernel.lengthscale = _ls
+        supra_k.base_kernel.tau = horizon
+        supra_k.outputscale = lk_scale
+
+    # deactivate parameters if desired
     if only_amp or only_global_amp:
         ml.raw_lengthscale.requires_grad_(False)
         if real:
