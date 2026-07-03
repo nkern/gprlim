@@ -10,7 +10,7 @@ from torch import Tensor
 
 from gpytorch.constraints import Interval, Positive
 from gpytorch.priors import Prior, LogNormalPrior, NormalPrior
-from gpytorch.kernels import RBFKernel, ScaleKernel, Kernel
+from gpytorch.kernels import RBFKernel, ScaleKernel, Kernel, AdditiveKernel
 from gpytorch.means import ConstantMean
 
 from . import utils

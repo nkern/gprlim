@@ -32,7 +32,7 @@ def mean_center(y, noise, dim=-1):
 
 
 def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend=False,
-                      rcond=1e-15, method='cholesky', chunk=None):
+                      rcond=1e-15, method='cholesky', chunk=None, pred_kernel=None):
     """
     GP posterior mean (Wiener filter) ``Cp (Cs + diag(noise))^-1 (y - mu) + mu`` along one
     axis of ``y``, batched over all the others.
@@ -55,6 +55,11 @@ def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend
     pred_x : tensor, optional
         Prediction grid (Npred,); the cross-covariance K(pred_x, x) is used. Default predicts
         at the training points (Npred = Nx).
+    pred_kernel : gpytorch.kernels.Kernel, optional
+        Separate prediction covariance ``Cp`` for the output operator in the Wiener filter
+        ``Cp (Cs + diag(noise))^-1 y`` -- e.g. to reconstruct a single signal component (``Cs``
+        is still the full signal-plus-other covariance used in the solve). Default None reuses
+        ``kernel`` as ``Cp``. Evaluated at ``pred_x`` (as ``pred_kernel(pred_x, x)``) if given.
     mu : callable, optional
         Mean function ``mu(x[:, None]) -> (..., Nx)``; default zero mean.
     dim : int, optional
@@ -88,8 +93,9 @@ def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend
     with torch.no_grad():
         # get dense kernel
         gx = x if pred_x is None else torch.as_tensor(pred_x).reshape(-1)
+        pk = kernel if pred_kernel is None else pred_kernel       # Cp kernel (defaults to Cs's)
         Cs = kernel(x[:, None]).to_dense()
-        Cp = Cs if pred_x is None else kernel(gx[:, None], x[:, None]).to_dense()
+        Cp = Cs if (pred_x is None and pred_kernel is None) else pk(gx[:, None], x[:, None]).to_dense()
 
         # get mean
         mu_x = 0.0 if mu is None else mu(x[:, None])
@@ -116,7 +122,8 @@ def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend
 
 def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=None,
                       C1_rcond=None, method='woodbury', mu=None, dims=(-2, -1), detrend=False,
-                      rcond=1e-12, cg_tol=1e-4, cg_max_iter=5000, n_threads=1):
+                      rcond=1e-12, cg_tol=1e-4, cg_max_iter=5000, n_threads=1,
+                      pred_kernel1=None, pred_kernel2=None):
     """
     GP posterior mean for a separable 2D covariance ``K = C1 (x) C2`` (``C1 = kernel1`` over
     ``x1``, the slow/outer axis; ``C2 = kernel2`` over ``x2``), batched over the leading axis
@@ -142,6 +149,12 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
         ``C2(pred_x2, x2)`` are applied to the solved coefficients to predict at new points
         (either axis independently; default predicts on the (x1, x2) grid). Not supported
         together with ``C1_rcond`` (truncation applies to the training block only).
+    pred_kernel1, pred_kernel2 : gpytorch.kernels.Kernel, optional
+        Separate prediction factor kernels for the output operator ``Kp = Cp1 (x) Cp2`` in the
+        Wiener filter ``Kp (Ks + diag(noise))^-1 y`` -- e.g. to reconstruct a single signal
+        component (``Ks = C1 (x) C2`` is still the full covariance used in the solve). Default
+        None reuses ``kernel1`` / ``kernel2``. Compatible with ``C1_rcond`` (which truncates only
+        the signal block ``Ks``); evaluated at ``pred_x1`` / ``pred_x2`` if those are given.
     C1_rcond : float, optional
         Relative eigenvalue cutoff in (0, 1] for a low-rank truncation of the outer factor
         ``C1`` (keep modes with ``lambda >= C1_rcond * lambda_max``, drop the rest; see
@@ -199,8 +212,10 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
         # the output operators: training covariances (predict on the grid) or cross-covariances.
         C1 = truncate(kernel1(x1[:, None]).to_dense().detach(), C1_rcond)
         C2 = kernel2(x2[:, None]).to_dense().detach()
-        Bp1 = C1 if pred_x1 is None else kernel1(gx1[:, None], x1[:, None]).to_dense().detach()
-        Bp2 = C2 if pred_x2 is None else kernel2(gx2[:, None], x2[:, None]).to_dense().detach()
+        pk1 = kernel1 if pred_kernel1 is None else pred_kernel1   # Cp factors (default to Cs's)
+        pk2 = kernel2 if pred_kernel2 is None else pred_kernel2
+        Bp1 = C1 if (pred_x1 is None and pred_kernel1 is None) else pk1(gx1[:, None], x1[:, None]).to_dense().detach()
+        Bp2 = C2 if (pred_x2 is None and pred_kernel2 is None) else pk2(gx2[:, None], x2[:, None]).to_dense().detach()
 
         # complex strategy: split real/imag for a real covariance, else solve directly
         # (promoting a real cov to complex for complex data).
@@ -236,7 +251,7 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
 
 
 def inpaint_1d(kernel, x, y, noise, flags, mu=None, dim=-1, detrend=False,
-               rcond=1e-15, method='cholesky', chunk=None):
+               rcond=1e-15, method='cholesky', chunk=None, pred_kernel=None):
     """
     Inpaint ``y`` at flagged pixels with the 1D GP posterior mean.
 
@@ -267,6 +282,10 @@ def inpaint_1d(kernel, x, y, noise, flags, mu=None, dim=-1, detrend=False,
     detrend : bool, optional
         Subtract a per-row inverse-noise-weighted mean before the solve and add it back (see
         :func:`posterior_mean_1d`).
+    pred_kernel : gpytorch.kernels.Kernel, optional
+        Separate prediction covariance ``Cp`` for the model written into the gaps -- e.g. to
+        inpaint a single signal component; default None reuses ``kernel``. See
+        :func:`posterior_mean_1d`.
     rcond, method, chunk
         Forwarded to :func:`posterior_mean_1d` (the batched solver).
 
@@ -278,13 +297,13 @@ def inpaint_1d(kernel, x, y, noise, flags, mu=None, dim=-1, detrend=False,
         The full posterior-mean model over the grid (same shape/dtype as ``y``).
     """
     mdl = posterior_mean_1d(kernel, x, y, noise, mu=mu, dim=dim, detrend=detrend,
-                            rcond=rcond, method=method, chunk=chunk)
+                            rcond=rcond, method=method, chunk=chunk, pred_kernel=pred_kernel)
     return torch.where(flags, mdl, y), mdl
 
 
 def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, C1_rcond=None, mu=None, detrend=False,
                dims=(-2, -1), method='woodbury', rcond=1e-12, cg_tol=1e-4, cg_max_iter=5000,
-               n_threads=1):
+               n_threads=1, pred_kernel1=None, pred_kernel2=None):
     """
     Inpaint ``y`` at flagged pixels with the 2D GP posterior mean (separable ``C1 (x) C2``).
 
@@ -316,6 +335,10 @@ def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, C1_rcond=None, mu=None
     detrend : bool, optional
         Subtract an inverse-noise-weighted mean over the (x1, x2) axes before the solve and
         add it back (see :func:`posterior_mean_2d`).
+    pred_kernel1, pred_kernel2 : gpytorch.kernels.Kernel, optional
+        Separate prediction factor kernels for the model written into the gaps -- e.g. to inpaint
+        a single signal component; default None reuses ``kernel1`` / ``kernel2``. See
+        :func:`posterior_mean_2d`.
     dims, method, rcond, cg_tol, cg_max_iter, n_threads
         Forwarded to :func:`posterior_mean_2d` (``dims`` = the two GP axes of ``y``).
 
@@ -328,7 +351,8 @@ def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, C1_rcond=None, mu=None
     """
     mdl = posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, C1_rcond=C1_rcond, mu=mu,
                             detrend=detrend, dims=dims, method=method, rcond=rcond, cg_tol=cg_tol,
-                            cg_max_iter=cg_max_iter, n_threads=n_threads)
+                            cg_max_iter=cg_max_iter, n_threads=n_threads,
+                            pred_kernel1=pred_kernel1, pred_kernel2=pred_kernel2)
     return torch.where(flags, mdl, y), mdl
 
 

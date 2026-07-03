@@ -430,6 +430,63 @@ def test_posterior_mean_2d():
         posterior_mean_2d(k1c, k2, x1, x2, y, noise, pred_x1=px1, C1_rcond=1e-2)
 
 
+def test_posterior_mean_pred_kernel():
+	"""A separate prediction kernel Cp (!= signal Cs) yields the Wiener output Cp (Cs+N)^-1 y:
+	None reuses Cs; otherwise matches a dense reference in 1D and 2D (all methods), is forwarded
+	by inpaint, and coexists with C1_rcond (which truncates the signal block only)."""
+	torch.manual_seed(0)
+
+	def K(ls):
+		k = ScaleKernel(RBFKernel()).double()
+		k.base_kernel.lengthscale = ls
+		k.outputscale = 1.0
+		return k
+
+	# ---- 1D ----
+	Nx = 24
+	x = torch.linspace(0, 10, Nx, dtype=torch.float64)
+	ks, kp = K(2.0), K(0.5)                                   # signal vs different prediction kernel
+	y = torch.randn(4, Nx, dtype=torch.float64)
+	noise = 0.1 + torch.rand(4, Nx, dtype=torch.float64)
+	Cs = ks(x[:, None]).to_dense().detach()
+	Cp = kp(x[:, None]).to_dense().detach()
+	ref = torch.stack([Cp @ torch.linalg.solve(Cs + torch.diag(noise[b]), y[b]) for b in range(4)])
+	assert torch.allclose(posterior_mean_1d(ks, x, y, noise),
+	                      posterior_mean_1d(ks, x, y, noise, pred_kernel=ks))   # None reuses Cs
+	out = posterior_mean_1d(ks, x, y, noise, pred_kernel=kp)
+	assert torch.allclose(out, ref, atol=1e-8)
+	assert not torch.allclose(out, posterior_mean_1d(ks, x, y, noise))         # genuinely different
+
+	# ---- 2D (all methods) + inpaint forwarding + C1_rcond coexistence ----
+	N1, N2 = 5, 7
+	x1 = torch.linspace(0, 5, N1, dtype=torch.float64)
+	x2 = torch.linspace(0, 7, N2, dtype=torch.float64)
+	k1s, k2s, k1p, k2p = K(2.0), K(2.0), K(1.0), K(0.7)
+	y2 = torch.randn(3, N1, N2, dtype=torch.float64)
+	n2 = 0.1 + torch.rand(3, N1, N2, dtype=torch.float64)
+	Ks = torch.kron(k1s(x1[:, None]).to_dense().detach(), k2s(x2[:, None]).to_dense().detach())
+	Kp = torch.kron(k1p(x1[:, None]).to_dense().detach(), k2p(x2[:, None]).to_dense().detach())
+	ref2 = torch.stack([(Kp @ torch.linalg.solve(Ks + torch.diag(n2[b].reshape(-1)),
+	                                              y2[b].reshape(-1))).reshape(N1, N2) for b in range(3)])
+	for method in ('woodbury', 'cg', 'cholesky'):
+		out2 = posterior_mean_2d(k1s, k2s, x1, x2, y2, n2, pred_kernel1=k1p, pred_kernel2=k2p,
+		                         method=method, rcond=1e-14, cg_tol=1e-11, cg_max_iter=4000)
+		assert torch.allclose(out2, ref2, atol=1e-6), method
+	assert torch.allclose(posterior_mean_2d(k1s, k2s, x1, x2, y2, n2, method='cholesky'),
+	                      posterior_mean_2d(k1s, k2s, x1, x2, y2, n2, pred_kernel1=k1s,
+	                                        pred_kernel2=k2s, method='cholesky'))   # None reuses Cs
+	# inpaint forwards pred_kernel (mdl == reference, shape preserved)
+	flags = torch.zeros(3, N1, N2, dtype=torch.bool); flags[:, :, ::3] = True
+	inp, mdl = inpaint_2d(k1s, k2s, x1, x2, y2, n2, flags, pred_kernel1=k1p, pred_kernel2=k2p,
+	                      method='cholesky')
+	assert mdl.shape == y2.shape and torch.allclose(mdl, ref2, atol=1e-6)
+	assert torch.allclose(inp, torch.where(flags, mdl, y2))
+	# pred_kernel coexists with C1_rcond (which truncates only the signal block) -- runs, right shape
+	mt = posterior_mean_2d(k1s, k2s, x1, x2, y2, n2, pred_kernel1=k1p, pred_kernel2=k2p,
+	                       C1_rcond=1e-6, method='cg', cg_tol=1e-8)
+	assert mt.shape == y2.shape
+
+
 def test_posterior_mean_broadcasts_noise():
     """Shared / lower-rank noise broadcasts against y (the documented contract): 1d & 2d with
     noise (1, ...) or (Nx,) match the fully-expanded noise -- regression for the Nbls>1
