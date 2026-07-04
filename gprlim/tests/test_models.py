@@ -487,6 +487,37 @@ def test_posterior_mean_pred_kernel():
 	assert mt.shape == y2.shape
 
 
+def test_precond_blockdiag_matches_eigen():
+    """The 'blockdiag' CG preconditioner returns the SAME posterior mean as the default 'eigen'
+    one (to cg_tol) for separable, non-separable, and mixed flag patterns, and reverts to 'eigen'
+    bit-for-bit when no whole channel is flagged. A preconditioner never changes the solution."""
+    torch.manual_seed(0)
+    Nb, N1, N2 = 2, 50, 64
+    x1 = torch.linspace(0, 25, N1, dtype=torch.float64)
+    x2 = torch.linspace(100, 150, N2, dtype=torch.float64)
+    k1 = ScaleKernel(RBFKernel()).double(); k1.base_kernel.lengthscale = 6.0; k1.outputscale = 1.0
+    k2 = kernels.ScaleKernel(kernels.SincKernel()).double(); k2.base_kernel.lengthscale = 2.0; k2.outputscale = 1.0
+    y = torch.randn(Nb, N1, N2, dtype=torch.cdouble)
+
+    sep = torch.full((Nb, N1, N2), 1e-3, dtype=torch.float64); sep[:, :, 25:38] = 1e10  # full-channel gap
+    scat = torch.full((Nb, N1, N2), 1e-3, dtype=torch.float64)
+    scat[torch.rand(Nb, N1, N2) < 0.05] = 1e10                                          # scattered, no full channel
+    mixed = sep.clone(); mixed[torch.rand(Nb, N1, N2) < 0.03] = 1e10                     # gap + scatter
+
+    kw = dict(method='cg', cg_tol=1e-5, cg_max_iter=8000)
+    for name, noise in [('separable', sep), ('scatter', scat), ('mixed', mixed)]:
+        m_eig = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='eigen', **kw)
+        m_bd = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='blockdiag', **kw)
+        assert torch.allclose(m_bd, m_eig, atol=1e-4), (name, (m_bd - m_eig).abs().max())
+
+    # no fully-flagged channel -> blockdiag reverts to eigen exactly (bit-for-bit)
+    m_eig = posterior_mean_2d(k1, k2, x1, x2, y, scat, precond='eigen', **kw)
+    m_bd = posterior_mean_2d(k1, k2, x1, x2, y, scat, precond='blockdiag', **kw)
+    assert (m_bd - m_eig).abs().max().item() == 0.0
+    with pytest.raises(ValueError):
+        posterior_mean_2d(k1, k2, x1, x2, y, sep, precond='nope', **kw)
+
+
 def test_posterior_mean_broadcasts_noise():
     """Shared / lower-rank noise broadcasts against y (the documented contract): 1d & 2d with
     noise (1, ...) or (Nx,) match the fully-expanded noise -- regression for the Nbls>1

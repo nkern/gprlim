@@ -163,6 +163,34 @@ def test_kron_eigen_preconditioner_accelerates():
     assert pc["iters"] < none["iters"]
 
 
+@pytest.mark.parametrize("cplx", [False, True])
+def test_kron_blockdiag_preconditioner(cplx):
+    # M^-1 for M = P (x) F + I (x) diag(Df): inverts M exactly (dense reference), real & complex P
+    Nt, Nf = 6, 5
+    P, F = _kron_cores(Nt, Nf, cplx)
+    Df = 0.1 + torch.rand(Nf, dtype=DOUBLE)
+    v = _vec((3, Nt * Nf), cplx, 3)
+    Ks = _kron_dense(P, F)
+    M = Ks + torch.kron(torch.eye(Nt, dtype=Ks.dtype), torch.diag(Df).to(Ks.dtype))
+    ref = torch.linalg.solve(M, v.unsqueeze(-1)).squeeze(-1)
+    assert torch.allclose(solvers.kron_blockdiag_preconditioner(P, F, Df)(v), ref, atol=1e-8)
+
+
+def test_kron_blockdiag_preconditioner_accelerates():
+    # for time-separable noise (I (x) diag(Df)) the block-diag preconditioner is the EXACT inverse,
+    # so preconditioned CG converges in ~1 iteration -- far fewer than the scalar-shift eigen one
+    Nt, Nf = 12, 10
+    P, F = _kron_cores(Nt, Nf, True, seed=7)
+    Df = torch.full((Nf,), 1e-3, dtype=DOUBLE); Df[3:6] = 1e8       # a fully-flagged channel "gap"
+    noise = Df.expand(Nt, Nf).reshape(-1)                          # separable: same Df at every time
+    A, b = solvers.kron_matvec(P, F, diag=noise), _vec((Nt * Nf,), True, 8)
+    _, eig = solvers.pcg(A, b, M=solvers.kron_eigen_preconditioner(P, F, shift=float(Df.min())),
+                         tol=1e-8, max_iter=3000, weight=noise.reciprocal())
+    _, bd = solvers.pcg(A, b, M=solvers.kron_blockdiag_preconditioner(P, F, Df),
+                        tol=1e-8, max_iter=3000, weight=noise.reciprocal())
+    assert bd["iters"] <= 2 and bd["iters"] < eig["iters"]
+
+
 # --------------------------------------------------------------------------------------
 # high-level kron_wiener_cg: kron-sparse solve == dense model, real and complex
 # --------------------------------------------------------------------------------------

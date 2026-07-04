@@ -269,6 +269,56 @@ def kron_eigen_preconditioner(Ct, Cf, shift=0.0):
     return apply_Minv
 
 
+def kron_blockdiag_preconditioner(Ct, Cf, Df):
+    r"""
+    Structured (no-densify) preconditioner for ``M = Ct (x) Cf + I (x) diag(Df)`` -- the natural
+    preconditioner when the noise is *separable across the outer (time) axis*: whole inner-axis
+    (frequency) channels flagged the same way at every time, so ``diag(noise) = I (x) diag(Df)``
+    with ``Df`` the per-channel noise (large on fully-flagged channels).
+
+    Unlike the scalar-shift :func:`kron_eigen_preconditioner`, this carries the *full-channel
+    flag structure exactly*, so preconditioned CG converges in a handful of iterations -- and in
+    a single iteration (it is then the exact inverse) when the noise is exactly separable.
+
+    Mechanism: ``M`` block-diagonalizes in the eigenbasis of ``Ct = Qt diag(lam_t) Qt^H``,
+    ``(Qt^H (x) I) M (Qt (x) I) = blockdiag_i( lam_t[i] Cf + diag(Df) )``, so ``M^-1 r`` is a
+    rotate (by ``Qt^H`` over the outer axis), ``Ntimes`` independent ``Nfreqs x Nfreqs`` block
+    solves (Cholesky factored once), and a rotate back. Every block is Hermitian PD (``Df > 0``,
+    ``lam_t`` clamped at 0), so it never breaks down.
+
+    Parameters
+    ----------
+    Ct : tensor
+        Outer/time-axis kernel, Hermitian PSD (Ntimes, Ntimes), real or complex.
+    Cf : tensor
+        Inner/frequency-axis kernel, Hermitian PSD (Nfreqs, Nfreqs).
+    Df : tensor
+        Per-inner-channel noise variance (Nfreqs,), strictly positive -- the time-independent
+        part of the noise (fully-flagged channels carry the large value).
+
+    Returns
+    -------
+    callable
+        ``r -> M^-1 r`` on vectors of shape (..., Ntimes*Nfreqs).
+    """
+    dt = torch.promote_types(Ct.dtype, Cf.dtype)
+    Ct, Cf = Ct.to(dt), Cf.to(dt)
+    Ntimes, Nfreqs = Ct.shape[-1], Cf.shape[-1]
+    lam_t, Qt = torch.linalg.eigh(Ct)
+    lam_t = lam_t.clamp_min(0)                                     # PD blocks even for tiny negative eig
+    # the Ntimes blocks  B_i = lam_t[i] * Cf + diag(Df); Cholesky factored ONCE and shared
+    L = torch.linalg.cholesky(lam_t.view(Ntimes, 1, 1) * Cf + torch.diag(Df))
+    Qt = Qt.contiguous()
+
+    def apply_Minv(r):
+        R = r.reshape(*r.shape[:-1], Ntimes, Nfreqs)
+        Rt = torch.einsum('ti,...tf->...if', Qt.conj(), R)        # (Qt^H (x) I) r
+        Xt = torch.cholesky_solve(Rt.reshape(-1, Ntimes, Nfreqs).permute(1, 2, 0), L)
+        Xt = Xt.permute(2, 0, 1).reshape(Rt.shape)                # per-time-mode Nfreqs x Nfreqs solves
+        return torch.einsum('ti,...if->...tf', Qt, Xt).reshape(*r.shape[:-1], Ntimes * Nfreqs)
+    return apply_Minv
+
+
 # --------------------------------------------------------------------------------------
 # structured Kronecker matvec + high-level preconditioned-CG Wiener solve
 # --------------------------------------------------------------------------------------
@@ -302,7 +352,7 @@ def kron_matvec(Ct, Cf, diag=None):
 
 
 def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=None, n_threads=1,
-                   return_alpha=False):
+                   return_alpha=False, precond='eigen'):
     r"""
     Complex Wiener posterior mean  ``m = (Ct (x) Cf) (Ct (x) Cf + diag(noise))^-1 y``  via
     preconditioned CG: structured throughout (never densifies the ``(Ntimes*Nfreqs)^2``
@@ -322,6 +372,15 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
     shift : float, optional
         Preconditioner diagonal shift; default the smallest noise value (the good-pixel
         variance), which makes the preconditioner capture the bulk of ``A``.
+    precond : str, optional
+        CG preconditioner: 'eigen' (default) is the scalar-shift Kronecker-eigen preconditioner
+        :func:`kron_eigen_preconditioner`. 'blockdiag' is the block-diagonal
+        :func:`kron_blockdiag_preconditioner` -- exact when the noise is separable across the
+        outer axis (whole inner-axis channels flagged the same at every time), cutting CG to a
+        handful of iterations. It builds the per-channel noise ``Df = min`` over the batch/outer
+        axis and *reverts to 'eigen' automatically* when no channel is fully flagged, so it never
+        does more iterations than 'eigen'. Preconditioner choice does not change the solution
+        (both solve the true ``A`` to ``tol``), only the iteration count.
     tol, max_iter, x0
         Forwarded to :func:`pcg`. The stop test uses the inverse-variance-weighted relative
         residual (``weight = 1/noise``), so high-variance flagged pixels drop out of it and
@@ -358,7 +417,18 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
     # Built ONCE (one eigh per axis) and shared across all baselines / threads.
     if shift is None:
         shift = float(noise_f.real.amin())
-    M = kron_eigen_preconditioner(Ct, Cf, shift=shift)
+    if precond == 'eigen':
+        M = kron_eigen_preconditioner(Ct, Cf, shift=shift)
+    elif precond == 'blockdiag':
+        # per-channel (inner-axis) noise = min over the batch & outer (time) axis: the
+        # time-independent part, large on fully-flagged channels. If no channel is fully flagged
+        # (Df uniform) M IS the scalar-shift preconditioner, so fall back to the cheaper eigen
+        # apply -- identical iterations, no per-iteration overhead.
+        Df = noise.reshape(-1, Nfreqs).real.amin(dim=0)
+        M = (kron_blockdiag_preconditioner(Ct, Cf, Df) if bool((Df > Df.amin()).any())
+             else kron_eigen_preconditioner(Ct, Cf, shift=shift))
+    else:
+        raise ValueError(f"precond must be 'eigen' or 'blockdiag', got {precond!r}")
 
     def solve(yf, nf, xf):
         # alpha = (Ct (x) Cf + diag(noise))^-1 yf via preconditioned CG (A never densified),
