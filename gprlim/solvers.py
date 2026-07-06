@@ -109,6 +109,50 @@ def truncate(C, rcond):
     return (Q * wk.unsqueeze(-2)) @ Q.conj().transpose(-1, -2)   # Q diag(wk) Q^H
 
 
+def shrink(C, rcond):
+    r"""
+    Shrink a Hermitian-PSD covariance's *spectrum toward flat* (a scaled identity) via its
+    eigendecomposition -- the mirror image of :func:`truncate`.
+
+    Instead of dropping the small eigenvalues, it *lifts* them to a floor ``rcond * lambda_max``
+    and renormalizes so the trace (hence the marginal variance) is preserved::
+
+        C_shrink = c * Q diag(max(lambda_i, rcond * lambda_max)) Q^H,   c = tr(C) / tr(floored).
+
+    Lifting the near-zero (fast) modes back above the noise gives them nonzero Wiener gain. In the
+    2D joint solve, applied to the time factor ``Ct`` this interpolates from the full joint model
+    (``rcond`` -> 0) toward the per-``x2``-independent 1D solve: at ``rcond = 1`` the spectrum is
+    flattened to ``lambda_max`` everywhere, so (trace-preserved) ``Ct`` becomes ``mean(diag(Ct))*I``
+    -- ``Ct (x) Cf = I (x) Cf`` up to amplitude -- which is exactly the 1D inpaint along ``x2``
+    (per-``x1`` independent). It is the *opposite direction* from :func:`truncate` (which confines
+    toward rank-1). Lifting is inherently front-loaded, so tune ``rcond`` on a log scale (like a
+    ``pinv`` cutoff). See [[joint-eta-delay-confinement]].
+
+    Parameters
+    ----------
+    C : tensor or LinearOperator
+        Hermitian-PSD covariance of shape (..., n, n); a ``LinearOperator`` is densified for the
+        eigendecomposition. Returns a dense tensor.
+    rcond : float or None
+        Relative eigenvalue floor in (0, 1]. ``0`` / ``None`` is a no-op (returns ``C``
+        unchanged); ``rcond = 1`` fully flattens the spectrum (``C`` proportional to the identity).
+
+    Returns
+    -------
+    tensor
+        The spectrum-shrunk covariance ``C_shrink`` (full rank, trace preserved).
+    """
+    if not rcond:                                 # 0 / 0.0 / None -> unchanged
+        return C
+    if not 0.0 < rcond <= 1.0:
+        raise ValueError(f"rcond must be in (0, 1], got {rcond}")
+    dense = C.to_dense() if isinstance(C, LinearOperator) else C
+    w, Q = torch.linalg.eigh(dense)               # ascending real eigenvalues; w[..., -1] = lam_max
+    wf = torch.clamp_min(w, rcond * w[..., -1:])  # lift modes below the floor up to it
+    wf = wf * (w.sum(-1, keepdim=True) / wf.sum(-1, keepdim=True))   # renormalize trace (preserve variance)
+    return (Q * wf.unsqueeze(-2)) @ Q.conj().transpose(-1, -2)   # Q diag(wf) Q^H
+
+
 # --------------------------------------------------------------------------------------
 # preconditioned conjugate gradients
 # --------------------------------------------------------------------------------------
@@ -281,10 +325,16 @@ def kron_blockdiag_preconditioner(Ct, Cf, Df):
     a single iteration (it is then the exact inverse) when the noise is exactly separable.
 
     Mechanism: ``M`` block-diagonalizes in the eigenbasis of ``Ct = Qt diag(lam_t) Qt^H``,
-    ``(Qt^H (x) I) M (Qt (x) I) = blockdiag_i( lam_t[i] Cf + diag(Df) )``, so ``M^-1 r`` is a
-    rotate (by ``Qt^H`` over the outer axis), ``Ntimes`` independent ``Nfreqs x Nfreqs`` block
-    solves (Cholesky factored once), and a rotate back. Every block is Hermitian PD (``Df > 0``,
-    ``lam_t`` clamped at 0), so it never breaks down.
+    ``(Qt^H (x) I) M (Qt (x) I) = blockdiag_i( lam_t[i] Cf + diag(Df) )``. Rather than factor each
+    of the ``Ntimes`` blocks separately (that costs ``Ntimes`` ``Nfreqs x Nfreqs`` solves *per
+    apply* -- which for large ``Nfreqs`` can dominate and make CG net-slower than the scalar-shift
+    preconditioner despite fewer iterations), whiten once: ``Ctil = Df^-1/2 Cf Df^-1/2 =
+    V diag(nu) V^H`` shares its eigenvectors across every block, so ``B_i^-1 = G diag(1 /
+    (lam_t[i] nu + 1)) G^H`` with ``G = Df^-1/2 V``. Then ``M^-1 r`` is a rotate by ``Qt^H`` (outer
+    axis) and ``G^H`` (inner axis), an elementwise divide by ``lam_t (x) nu + 1``, and the two
+    rotates back -- FOUR small matmuls, the same per-apply cost as :func:`kron_eigen_preconditioner`.
+    Every block is Hermitian PD (``Df > 0``, ``lam_t`` clamped at 0 so ``nu >= 0``), so the divisor
+    is ``>= 1`` and it never breaks down.
 
     Parameters
     ----------
@@ -305,17 +355,21 @@ def kron_blockdiag_preconditioner(Ct, Cf, Df):
     Ct, Cf = Ct.to(dt), Cf.to(dt)
     Ntimes, Nfreqs = Ct.shape[-1], Cf.shape[-1]
     lam_t, Qt = torch.linalg.eigh(Ct)
-    lam_t = lam_t.clamp_min(0)                                     # PD blocks even for tiny negative eig
-    # the Ntimes blocks  B_i = lam_t[i] * Cf + diag(Df); Cholesky factored ONCE and shared
-    L = torch.linalg.cholesky(lam_t.view(Ntimes, 1, 1) * Cf + torch.diag(Df))
-    Qt = Qt.contiguous()
+    lam_t = lam_t.clamp_min(0)                                     # PSD blocks even for tiny negative eig
+    # whiten Cf by the per-channel noise and diagonalize ONCE: Ctil = Df^-1/2 Cf Df^-1/2 = V nu V^H.
+    # every block  B_i = lam_t[i] Cf + diag(Df)  then shares eigenvectors G = Df^-1/2 V, with
+    # B_i^-1 = G diag(1 / (lam_t[i] nu + 1)) G^H -- so M^-1 is four matmuls, not Ntimes block solves.
+    dinv = Df.rsqrt().to(dt)                                       # Df^-1/2
+    nu, V = torch.linalg.eigh(dinv[:, None] * Cf * dinv[None, :])
+    G = dinv[:, None] * V                                          # Df^-1/2 V, (Nfreqs, Nfreqs)
+    denom = lam_t[:, None] * nu.clamp_min(0)[None, :] + 1.0        # blocks' eigenvalues, (Ntimes, Nfreqs)
+    QtH, Gc, GT = Qt.conj().transpose(-1, -2), G.conj(), G.transpose(-1, -2)
 
     def apply_Minv(r):
         R = r.reshape(*r.shape[:-1], Ntimes, Nfreqs)
-        Rt = torch.einsum('ti,...tf->...if', Qt.conj(), R)        # (Qt^H (x) I) r
-        Xt = torch.cholesky_solve(Rt.reshape(-1, Ntimes, Nfreqs).permute(1, 2, 0), L)
-        Xt = Xt.permute(2, 0, 1).reshape(Rt.shape)                # per-time-mode Nfreqs x Nfreqs solves
-        return torch.einsum('ti,...if->...tf', Qt, Xt).reshape(*r.shape[:-1], Ntimes * Nfreqs)
+        Rt = QtH @ R                                              # (Qt^H (x) I) r -- rotate outer axis
+        Xt = ((Rt @ Gc) / denom) @ GT                            # whiten inner axis, divide, un-whiten
+        return (Qt @ Xt).reshape(*r.shape[:-1], Ntimes * Nfreqs)  # rotate back
     return apply_Minv
 
 

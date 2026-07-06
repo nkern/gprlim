@@ -317,6 +317,43 @@ def test_truncate(cplx):
     op = solvers.to_linear_operator(C)
     assert torch.allclose(solvers.truncate(op, 1e-2), solvers.truncate(C, 1e-2))
 
+
+@pytest.mark.parametrize("cplx", [False, True])
+def test_shrink(cplx):
+    """shrink(C, rcond): LIFT eigenmodes below rcond*lambda_max up to the floor and renormalize
+    the trace (the mirror of truncate). Hermitian PSD, FULL rank, trace preserved; rcond=1 ->
+    fully flat spectrum -> C proportional to the identity; lazy == dense."""
+    torch.manual_seed(0)
+    n = 8
+    t = torch.linspace(0, 20, n, dtype=DOUBLE)
+    if cplx:
+        k = kernels.CarrierKernel(kernels.ScaleKernel(kernels.RBFKernel()), tau=0.1).double()
+        k.base_kernel.base_kernel.lengthscale = 5.0
+    else:
+        k = kernels.ScaleKernel(kernels.RBFKernel()).double(); k.base_kernel.lengthscale = 5.0
+    C = k(t[:, None]).to_dense().detach()                       # smooth, rank-deficient
+
+    # rcond=0 / None are no-ops (same object)
+    assert solvers.shrink(C, 0.0) is C
+    assert solvers.shrink(C, None) is C
+
+    w, Q = torch.linalg.eigh(C)
+    for rcond in (1e-3, 1e-1, 1.0):
+        S = solvers.shrink(C, rcond)
+        wf = w.clamp_min(rcond * w[-1]); wf = wf * (w.sum() / wf.sum())     # lifted + trace-renormalized
+        expected = (Q * wf) @ Q.conj().T
+        assert torch.allclose(S, expected, atol=1e-10)
+        assert torch.allclose(S, S.conj().transpose(-1, -2))               # Hermitian preserved
+        assert torch.linalg.eigvalsh(S).amin() > 1e-9 * torch.linalg.eigvalsh(S).amax()  # FULL rank
+        assert torch.allclose(S.diagonal().real.sum(), C.diagonal().real.sum(), atol=1e-8)  # trace preserved
+    # rcond=1 -> spectrum flattened -> C proportional to the identity
+    S1 = solvers.shrink(C, 1.0)
+    assert torch.allclose(S1, torch.eye(n, dtype=S1.dtype) * C.diagonal().real.mean(), atol=1e-8)
+
+    # lazy operator in -> dense out, same values as the dense path
+    op = solvers.to_linear_operator(C)
+    assert torch.allclose(solvers.shrink(op, 1e-2), solvers.shrink(C, 1e-2))
+
     # out-of-range guard
     with pytest.raises(ValueError):
         solvers.truncate(C, 1.5)

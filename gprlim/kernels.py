@@ -1129,7 +1129,7 @@ def to_eigen(kernel, x, unravel=False, rcond=1e-12):
 
 def default_time_kernel(
     freqs, bl_vec, lat, buffer=None, hw_mult=1.0, min_hw=0.5,
-    ml_scale=1e2, fz_scale=1e-2, fr_scale=1e-4,
+    ml_scale=1e2, fz_scale=1e-1, fr_scale=3e-3,
     only_amp=True, only_global_amp=False, negate=True
     ):
     r"""
@@ -1206,7 +1206,7 @@ def default_time_kernel(
         lengthscale_constraint=Interval(0, 1e4),
         lengthscale_prior=LogNormalPrior(np.log(750.0), 0.3)
     )
-    ml.lengthscale = 750.0  # sec
+    ml.lengthscale = 500.0  # sec, calibrated to sims
 
     # set frate of main lobe with tight prior
     ml = CarrierKernel(
@@ -1218,12 +1218,12 @@ def default_time_kernel(
 
     ## FR=0 Kernel: with amplitude relative to main lobe kernel
     fz = ScaleKernel(
-        RBFKernel(lengthscale_constraint=Interval(0, 1e4),
+        RBFKernel(lengthscale_constraint=Interval(1e1, 1e5),
                   lengthscale_prior=LogNormalPrior(np.log(1e3), 0.3)),
         outputscale_constraint=Interval(1e-5, 1e3),
         outputscale_prior=LogNormalPrior(np.log(fz_scale), 5.0),
     )
-    fz.base_kernel.lengthscale = 1e3  # sec
+    fz.base_kernel.lengthscale = 3e3  # sec, calibrated to sims
     fz.outputscale = fz_scale
 
     ## Broad kernel: with amplitude relative to main lobe kernel
@@ -1275,8 +1275,8 @@ def default_time_kernel(
 
 
 def default_freq_kernel(
-    bl_vec, ml_scale=1e2, pf_scale=1e-1, wd_scale=1e-2, lk_scale=1e-3, lk_kern='twinrbf',
-    buffer=125.0, min_delay=50.0, only_amp=True, only_global_amp=False, real=True):
+    bl_vec, ml_scale=1e2, pf_scale=1e-1, wd_scale=1e-3, lk_scale=1e-3, lk_kern='twinrbf',
+    buffer=150.0, min_delay=50.0, only_amp=True, only_global_amp=False, real=True):
     r"""
     Default frequency kernel composed of
 

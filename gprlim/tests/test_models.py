@@ -28,9 +28,10 @@ from gprlim.models import (
     posterior_draws_1d,
     posterior_draws_2d,
     fit_axis_kernel,
+    fit_axis_kernel_2d,
     fit_kernel,
 )
-from gprlim.solvers import truncate
+from gprlim.solvers import shrink
 
 
 # The library is functional (no GPModel); this minimal ExactGP exists ONLY here, as the
@@ -341,7 +342,7 @@ def test_posterior_mean_1d():
 def test_posterior_mean_2d():
     """posterior_mean_2d (full 2D posterior mean on the grid, no flags) matches a dense
     per-baseline Wiener solve for woodbury/cg/cholesky, complex & real covariances, the
-    C1_rcond truncation, and a 2D mean function (mu) + detrend; pred_x raises NotImplementedError."""
+    C1_rcond shrinkage (incl. =1 -> the 1D inpaint), a 2D mean fn (mu) + detrend; pred_x raises NotImplementedError."""
     torch.manual_seed(0)
     Nb, N1, N2 = 3, 6, 7
     x1 = torch.linspace(0, 50, N1, dtype=torch.float64)
@@ -374,9 +375,15 @@ def test_posterior_mean_2d():
                                  rcond=1e-12, cg_tol=1e-11, cg_max_iter=3000)
         assert torch.allclose(outr, dense_ref(C1r), atol=1e-6), ('split', method)
 
-    # C1_rcond truncation: matches a dense solve with the low-rank-truncated outer factor
+    # C1_rcond spectrum-shrinkage: matches a dense solve with the spectrum-shrunk outer factor
     out_e = posterior_mean_2d(k1c, k2, x1, x2, y, noise, C1_rcond=1e-2, method='cholesky')
-    assert torch.allclose(out_e, dense_ref(truncate(C1c, 1e-2)), atol=1e-6)
+    assert torch.allclose(out_e, dense_ref(shrink(C1c, 1e-2)), atol=1e-6)
+    # C1_rcond=1 flattens C1 to a scaled identity -> the 2D solve IS the per-x1 1D inpaint along x2
+    kflat = kernels.ScaleKernel(kernels.RBFKernel()).double()
+    kflat.base_kernel.lengthscale = 15.0; kflat.outputscale = 1.0
+    out_1d = posterior_mean_2d(kflat, k2, x1, x2, y, noise, C1_rcond=1.0, method='cholesky')
+    ref_1d = torch.stack([posterior_mean_1d(k2, x2, y[b], noise[b]) for b in range(Nb)])
+    assert torch.allclose(out_1d, ref_1d, atol=1e-6)
 
     # mu (2D mean fn) + detrend: subtract both before the solve, add both back to the prediction
     muf = lambda a, b: torch.full((a.shape[0], b.shape[0]), 0.3 + 0.2j, dtype=torch.cdouble)
@@ -425,7 +432,7 @@ def test_posterior_mean_2d():
     assert torch.allclose(outr, dense_pred(C1r, Cp1r), atol=1e-6)
     # one axis only (pred_x2=None) -> (Nb, Npred1, N2)
     assert posterior_mean_2d(k1c, k2, x1, x2, y, noise, pred_x1=px1, method='cholesky').shape == (Nb, 4, N2)
-    # pred + C1_rcond truncation is not supported
+    # pred + C1_rcond shrinkage is not supported
     with pytest.raises(NotImplementedError):
         posterior_mean_2d(k1c, k2, x1, x2, y, noise, pred_x1=px1, C1_rcond=1e-2)
 
@@ -433,7 +440,7 @@ def test_posterior_mean_2d():
 def test_posterior_mean_pred_kernel():
 	"""A separate prediction kernel Cp (!= signal Cs) yields the Wiener output Cp (Cs+N)^-1 y:
 	None reuses Cs; otherwise matches a dense reference in 1D and 2D (all methods), is forwarded
-	by inpaint, and coexists with C1_rcond (which truncates the signal block only)."""
+	by inpaint, and coexists with C1_rcond (which shrinks the signal block only)."""
 	torch.manual_seed(0)
 
 	def K(ls):
@@ -481,7 +488,7 @@ def test_posterior_mean_pred_kernel():
 	                      method='cholesky')
 	assert mdl.shape == y2.shape and torch.allclose(mdl, ref2, atol=1e-6)
 	assert torch.allclose(inp, torch.where(flags, mdl, y2))
-	# pred_kernel coexists with C1_rcond (which truncates only the signal block) -- runs, right shape
+	# pred_kernel coexists with C1_rcond (which shrinks only the signal block) -- runs, right shape
 	mt = posterior_mean_2d(k1s, k2s, x1, x2, y2, n2, pred_kernel1=k1p, pred_kernel2=k2p,
 	                       C1_rcond=1e-6, method='cg', cg_tol=1e-8)
 	assert mt.shape == y2.shape
@@ -794,7 +801,7 @@ def test_fit_axis_kernel():
         return k
 
     kfit = fresh()
-    out = fit_axis_kernel(data, flags, noise, x, kfit, nsamp=Nclean, iters=15, opt='Adam')
+    out = fit_axis_kernel(data, flags, noise, x, kfit, nsamp=Nclean, iters=15, opt='Adam', rescale=False)
     assert out is kfit                                              # fit in place, returns kernel
 
     # equal to fitting only the pooled clean rows (garbage dropped by the completeness ranking;
@@ -868,6 +875,89 @@ def test_fit_axis_kernel_complex_cov():
     assert torch.allclose(kA.base_kernel.base_kernel.lengthscale,
                           kB.base_kernel.base_kernel.lengthscale, atol=1e-10)
     assert torch.allclose(kA.base_kernel.outputscale, kB.base_kernel.outputscale, atol=1e-10)
+
+
+def test_fit_axis_kernel_rescale():
+    """fit_axis_kernel(rescale=True): rescale the kernel variance to the GOOD-pixel data variance
+    * var_mult (drawn, so composite kernels work), scaling linearly and ignoring flagged/RFI
+    pixels; rescale=False leaves the amplitude alone. iters=0 isolates the rescale from the fit."""
+    torch.manual_seed(0)
+    Nrows, Nx = 50, 40
+    x = torch.linspace(0, 40, Nx, dtype=torch.float64)
+    ktrue = kernels.ScaleKernel(kernels.RBFKernel()).double()
+    ktrue.base_kernel.lengthscale = 6.0; ktrue.outputscale = 4.0
+    data = prior_draws_1d(ktrue, x, size=Nrows, generator=torch.Generator().manual_seed(1))  # var ~ 4
+    flags = torch.zeros(Nrows, Nx, dtype=torch.bool); flags[:, 15:20] = True
+    noise = torch.full((Nrows, Nx), 0.02, dtype=torch.float64); noise[flags] = 1e10
+    good_var = float(data[~flags].var())
+
+    def resc(d, var_mult=1.0, rescale=True):
+        k = kernels.ScaleKernel(kernels.RBFKernel()).double(); k.base_kernel.lengthscale = 6.0
+        fit_axis_kernel(d, flags, noise, x, k, iters=0, var_mult=var_mult, rescale=rescale,
+                        prior_draws=400, generator=torch.Generator().manual_seed(2))
+        return float(prior_draws_1d(k, x, size=800, generator=torch.Generator().manual_seed(8)).var())
+
+    assert 0.8 < resc(data) / good_var < 1.2                    # variance matches the good-pixel data variance
+    assert 1.8 < resc(data, var_mult=2.0) / resc(data) < 2.2    # var_mult scales it linearly
+    rfi = data.clone(); rfi[flags] = 1e3                        # amplitude uses GOOD pixels only ...
+    assert 0.9 < resc(rfi) / resc(data) < 1.1                   # ... so RFI in the flag region is ignored
+    assert resc(data, var_mult=5.0, rescale=False) / good_var < 2.0   # rescale=False bypasses var_mult
+    # rescale composes with the actual fit (iters>0): still ~ the good-pixel variance
+    kf = kernels.ScaleKernel(kernels.RBFKernel()).double(); kf.base_kernel.lengthscale = 1.0
+    fit_axis_kernel(data, flags, noise, x, kf, iters=15, prior_draws=400, generator=torch.Generator().manual_seed(3))
+    v = float(prior_draws_1d(kf, x, size=800, generator=torch.Generator().manual_seed(9)).var())
+    assert 0.6 < v / good_var < 1.5
+
+
+def test_fit_axis_kernel_2d():
+    """fit_axis_kernel_2d: the two 1D fits recover the axis lengthscales, kernel1 ends unit
+    variance, the composite variance matches the GOOD-pixel data variance * var_mult (and scales
+    linearly), and the amplitude ignores flagged (RFI) pixels. Real and complex data."""
+    torch.manual_seed(0)
+    Nb, Nt, Nf = 4, 56, 56
+    x1 = torch.linspace(0, 56, Nt, dtype=torch.float64)
+    x2 = torch.linspace(100, 156, Nf, dtype=torch.float64)
+
+    def K(ls, os=1.0):
+        k = ScaleKernel(RBFKernel()).double(); k.base_kernel.lengthscale = ls; k.outputscale = os
+        return k
+
+    # data from a known 2D GP (true ell_t=6, ell_f=10); a full-channel flag gap down-weighted in noise
+    data = prior_draws_2d(K(6.0, 3.0), K(10.0, 2.0), x1, x2, size=Nb, generator=torch.Generator().manual_seed(1))
+    flags = torch.zeros(Nb, Nt, Nf, dtype=torch.bool); flags[:, :, 26:32] = True
+    noise = torch.full((Nb, Nt, Nf), 0.02, dtype=torch.float64); noise[flags] = 1e10
+
+    def fit(d, var_mult=1.0):
+        kt, kf = K(1.0), K(1.0)                              # start from ell=1; the fits must move it
+        k1, k2 = fit_axis_kernel_2d(d, flags, noise, x1, x2, kt, kf, var_mult=var_mult,
+                                    iters=15, prior_draws=400, generator=torch.Generator().manual_seed(2))
+        return k1, k2, kt, kf
+
+    def var2d(k1, k2):
+        return float(prior_draws_2d(k1, k2, x1, x2, size=600, generator=torch.Generator().manual_seed(8)).var())
+
+    k1, k2, kt, kf = fit(data)
+    good_var = float(data[~flags].var())
+
+    # 1) the two 1D fits move the lengthscales from 1 toward the truth (within a factor of ~2)
+    assert 3.0 < float(kt.base_kernel.lengthscale) < 12.0
+    assert 5.0 < float(kf.base_kernel.lengthscale) < 20.0
+    # 2) kernel1 ends unit-variance
+    v1 = float(prior_draws_1d(k1, x1, size=600, generator=torch.Generator().manual_seed(7)).var())
+    assert 0.8 < v1 < 1.25
+    # 3) composite variance matches the GOOD-pixel data variance
+    assert 0.7 < var2d(k1, k2) / good_var < 1.3
+    # 4) var_mult scales the composite variance linearly
+    k1b, k2b, _, _ = fit(data, var_mult=2.0)
+    assert 1.75 < var2d(k1b, k2b) / var2d(k1, k2) < 2.25
+    # 5) amplitude uses GOOD pixels only: huge RFI in the flag region leaves it unchanged (the ~flags bug)
+    rfi = data.clone(); rfi[flags] = 1e3
+    k1r, k2r, _, _ = fit(rfi)
+    assert 0.85 < var2d(k1r, k2r) / var2d(k1, k2) < 1.15
+    # complex data runs and matches its good-pixel variance
+    dc = data + 1j * prior_draws_2d(K(6.0, 3.0), K(10.0, 2.0), x1, x2, size=Nb, generator=torch.Generator().manual_seed(9))
+    k1c, k2c, _, _ = fit(dc)
+    assert 0.7 < var2d(k1c, k2c) / float(dc[~flags].var()) < 1.3
 
 
 def _load(nbls=3, ntimes=48, fslice=slice(None)):

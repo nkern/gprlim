@@ -2,7 +2,7 @@ import math
 
 import torch
 
-from .solvers import (stack_ri, unstack_ri, promote_like, truncate, kron_cholesky,
+from .solvers import (stack_ri, unstack_ri, promote_like, shrink, kron_cholesky,
                       gpr_invert, cholesky_batched,
                       kron_woodbury_predict, kron_wiener_cg)
 
@@ -148,18 +148,20 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
         Prediction grids (Npred1,), (Npred2,); the cross-covariances ``C1(pred_x1, x1)`` and
         ``C2(pred_x2, x2)`` are applied to the solved coefficients to predict at new points
         (either axis independently; default predicts on the (x1, x2) grid). Not supported
-        together with ``C1_rcond`` (truncation applies to the training block only).
+        together with ``C1_rcond`` (the shrinkage applies to the training block only).
     pred_kernel1, pred_kernel2 : gpytorch.kernels.Kernel, optional
         Separate prediction factor kernels for the output operator ``Kp = Cp1 (x) Cp2`` in the
         Wiener filter ``Kp (Ks + diag(noise))^-1 y`` -- e.g. to reconstruct a single signal
         component (``Ks = C1 (x) C2`` is still the full covariance used in the solve). Default
-        None reuses ``kernel1`` / ``kernel2``. Compatible with ``C1_rcond`` (which truncates only
+        None reuses ``kernel1`` / ``kernel2``. Compatible with ``C1_rcond`` (which shrinks only
         the signal block ``Ks``); evaluated at ``pred_x1`` / ``pred_x2`` if those are given.
     C1_rcond : float, optional
-        Relative eigenvalue cutoff in (0, 1] for a low-rank truncation of the outer factor
-        ``C1`` (keep modes with ``lambda >= C1_rcond * lambda_max``, drop the rest; see
-        :func:`gprlim.solvers.truncate`). Keeping only the leading (smooth) time modes lowers
-        high-delay leakage and speeds CG. Default None (full joint, no truncation).
+        Relative eigenvalue *floor* in (0, 1] that shrinks the outer factor ``C1``'s spectrum
+        toward flat (lift modes to ``C1_rcond * lambda_max``, trace-preserved; see
+        :func:`gprlim.solvers.shrink`). Interpolates from the full 2D joint model (None / 0)
+        toward the per-``x1``-independent 1D solve: ``C1_rcond = 1`` flattens ``C1`` to a scaled
+        identity, so ``C1 (x) C2 = I (x) C2`` -- the 1D inpaint along ``x2``. Tune on a log scale.
+        Default None (full joint).
     method : str
         'woodbury' (default; low-rank, rank-truncated at ``rcond``), 'cg' (preconditioned CG,
         to ``cg_tol``, parallelized over the batch by ``n_threads``), or 'cholesky' (densify
@@ -186,8 +188,8 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
     """
     new_points = pred_x1 is not None or pred_x2 is not None
     if new_points and C1_rcond:
-        raise NotImplementedError("pred_x1/pred_x2 with C1_rcond truncation is not supported "
-                                  "(truncation applies only to the training block).")
+        raise NotImplementedError("pred_x1/pred_x2 with C1_rcond shrinkage is not supported "
+                                  "(the shrinkage applies only to the training block).")
     x1 = torch.as_tensor(x1).reshape(-1)
     x2 = torch.as_tensor(x2).reshape(-1)
     Nx1, Nx2 = x1.shape[-1], x2.shape[-1]
@@ -213,10 +215,10 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
             trend = mean_center(yc, nf, dim=(-2, -1))
             yc = yc - trend
 
-        # dense per-axis training factors (the (Nx1*Nx2)^2 covariance is never formed); low-rank
-        # truncate C1 (no-op if C1_rcond is None) -- keeps the leading time modes. Bp1/Bp2 are
+        # dense per-axis training factors (the (Nx1*Nx2)^2 covariance is never formed); spectrum-
+        # shrink C1 toward flat (no-op if C1_rcond is None) -- interpolates 2D->1D. Bp1/Bp2 are
         # the output operators: training covariances (predict on the grid) or cross-covariances.
-        C1 = truncate(kernel1(x1[:, None]).to_dense().detach(), C1_rcond)
+        C1 = shrink(kernel1(x1[:, None]).to_dense().detach(), C1_rcond)
         C2 = kernel2(x2[:, None]).to_dense().detach()
         pk1 = kernel1 if pred_kernel1 is None else pred_kernel1   # Cp factors (default to Cs's)
         pk2 = kernel2 if pred_kernel2 is None else pred_kernel2
@@ -333,9 +335,10 @@ def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, C1_rcond=None, mu=None
     flags : tensor
         Boolean mask, broadcastable to ``y`` (True where flagged).
     C1_rcond : float, optional
-        Relative eigenvalue cutoff in (0, 1] for a low-rank truncation of the outer factor
-        ``C1`` (keeps the leading time modes; lowers high-delay leakage and speeds CG -- see
-        :func:`gprlim.solvers.truncate` / :func:`posterior_mean_2d`).
+        Relative eigenvalue floor in (0, 1] that shrinks the outer factor ``C1``'s spectrum toward
+        flat, interpolating the 2D joint solve toward the per-``x1``-independent 1D inpaint along
+        ``x2`` (``C1_rcond = 1`` recovers the 1D solve; see
+        :func:`gprlim.solvers.shrink` / :func:`posterior_mean_2d`).
     mu : callable, optional
         2D mean function ``mu(x1[:, None], x2[:, None]) -> (..., Nx1, Nx2)``.
     detrend : bool, optional
@@ -558,7 +561,7 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, C1_r
 
         f_post = f_prior + posterior_mean(y - f_prior - eps),   eps ~ N(0, noise)
 
-    The prior draw uses the structured Kronecker Cholesky of the (``C1_rcond``-truncated)
+    The prior draw uses the structured Kronecker Cholesky of the (``C1_rcond``-shrunk)
     ``C1 (x) C2`` and the correction reuses :func:`posterior_mean_2d`, so the ``(Nx1*Nx2)^2``
     covariance is never formed. Complex data is handled as in :func:`posterior_mean_2d`. A mean
     function ``mu`` is carried by the prior draw (and so appears in the posterior samples).
@@ -580,9 +583,9 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, C1_r
     size : int, optional
         Number of posterior draws. Default 1.
     C1_rcond : float, optional
-        Relative eigenvalue cutoff in (0, 1] for a low-rank truncation of the outer factor
-        ``C1`` (keep modes with ``lambda >= C1_rcond * lambda_max``; see
-        :func:`gprlim.solvers.truncate`); applied to both the prior draw and the correction.
+        Relative eigenvalue floor in (0, 1] that shrinks the outer factor ``C1``'s spectrum toward
+        flat (lift modes to ``C1_rcond * lambda_max``, trace-preserved; ``C1_rcond = 1`` -> the 1D
+        solve; see :func:`gprlim.solvers.shrink`); applied to both the prior draw and the correction.
     dims : tuple, optional
         The two GP axes of ``y`` (mapped to the last two internally; default (-2, -1)).
     jitter : float, optional
@@ -608,11 +611,11 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, C1_r
     nf = torch.broadcast_to(noise, y.shape).movedim(dims, (-2, -1)).reshape(-1, n1, n2)
     Nb = yf.shape[0]
     with torch.no_grad():
-        C1 = truncate(kernel1(x1[:, None]).to_dense(), C1_rcond)
+        C1 = shrink(kernel1(x1[:, None]).to_dense(), C1_rcond)
         C2 = kernel2(x2[:, None]).to_dense()
         dt = torch.promote_types(C1.dtype, C2.dtype)             # uniform factor dtype
         cov_c = dt.is_complex
-        L = kron_cholesky([C1.to(dt), C2.to(dt)], jitter=jitter)  # chol of truncate(C1) (x) C2
+        L = kron_cholesky([C1.to(dt), C2.to(dt)], jitter=jitter)  # chol of shrink(C1) (x) C2
         z = _conv_normal((size, Nb, n1 * n2), y.is_complex(), cov_c, y.real.dtype, y.device, generator)
         f_prior = _chol_matmul(L, z).reshape(size, Nb, n1, n2)
         if mu is not None:
@@ -629,9 +632,10 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, C1_r
 
 
 def fit_axis_kernel(data, flags, noise, x, kernel, dim=-1, nsamp=512, iters=5,
-                    opt='LBFGS', method='cholesky'):
+                    opt='LBFGS', method='cholesky', rescale=True, var_mult=1.0,
+                    prior_draws=100, generator=None):
     """
-    Fit a kernel's hyperparameters by marginal likelihood along one axis (IN PLACE).
+    Fit a kernel's hyperparameters by marginal likelihood along one axis.
 
     The GP/sample axis of ``data`` is ``dim`` (length ``len(x)``); every other axis is
     flattened into the pooled rows (so the full (Nbls, Ntimes, Nfreqs) cube can be passed
@@ -647,7 +651,7 @@ def fit_axis_kernel(data, flags, noise, x, kernel, dim=-1, nsamp=512, iters=5,
         Data of shape (..., Nx, ...), with the sample axis at ``dim`` (real or complex).
     flags : tensor
         Boolean flags (True where flagged), broadcastable to ``data``; used only to rank rows
-        by completeness for the fit.
+        by completeness for the fit, and scale kernel by empirical data variance.
     noise : tensor
         Noise variance, broadcastable to ``data``; flagged pixels assumed already down-weighted.
     x : tensor
@@ -664,6 +668,16 @@ def fit_axis_kernel(data, flags, noise, x, kernel, dim=-1, nsamp=512, iters=5,
         Optimizer forwarded to :func:`fit_kernel` (e.g. 'LBFGS', 'Adam').
     method : str, optional
         Marginal-likelihood solver, 'cholesky' (stable) or 'woodbury'.
+    rescale : bool, optional
+        If True (default), rescale the kernel variance to match the data variance
+        multiplied by var_mult. If kernel is not ScaleKernel, wraps it and returns.
+    var_mult : float, optional
+        Multiple of the empirical data variance to put into the kernel (default 1.0 =
+        match ``data.var()`` exactly). Use ``< 1`` for a signal amplitude below the data variance
+        (e.g. to leave out the noise contribution), ``> 1`` for above.        
+    prior_draws : int, optional
+        Number of 1D prior draws per factor used to estimate its variance for the unit/total
+        rescaling (default 100).
 
     Returns
     -------
@@ -695,7 +709,101 @@ def fit_axis_kernel(data, flags, noise, x, kernel, dim=-1, nsamp=512, iters=5,
         ys, nzs = s, nz
 
     fit_kernel(kernel, x[None, :, None], ys, nzs, Niter=iters, opt=opt, method=method)
+
+    if rescale:
+        from .kernels import ScaleKernel
+        if not isinstance(kernel, ScaleKernel):
+            p = next(kernel.parameters(), None)
+            kernel = ScaleKernel(kernel)
+            if p is not None:
+                kernel = kernel.to(dtype=p.dtype, device=p.device)
+
+        # draw prior from kernel to get total variance
+        svar = prior_draws_1d(kernel, x, size=prior_draws, jitter=1e-10, generator=generator).var()
+
+        # scale kernel1 to unit variance, and kernel2 to carry the whole composite variance
+        dvar = data[~flags.expand(data.shape)].var() * var_mult
+        kernel.outputscale = kernel.outputscale / svar * dvar
+
     return kernel
+
+
+def fit_axis_kernel_2d(data, flags, noise, x1, x2, kernel1, kernel2, dims=(-2, -1),
+                       rescale=True, var_mult=1.0, nsamp=512, iters=5, opt='LBFGS',
+                       method='cholesky', prior_draws=100, generator=None):
+    """
+    Fit a separable 2D Kronecker kernel ``C1(x1) (x) C2(x2)`` by two independent 1D axis fits, then
+    set the overall amplitude empirically, setting C1 to have unit diagonal and C2 to have
+    the variance of the data.
+
+    Parameters
+    ----------
+    data : tensor
+        N-d data with the GP axes at ``dims``, assumed already de-trended (zero-mean); real or
+        complex. Its variance sets the composite amplitude (see ``var_mult``).
+    flags, noise : tensor
+        Flag mask and noise (inverse weights), broadcastable to ``data``; forwarded to the two 1D
+        fits (flags rank rows by completeness, noise down-weights flagged pixels).
+    x1, x2 : tensor
+        The two 1D grids (lengths ``data.shape[dims[0]]`` / ``data.shape[dims[1]]``).
+    kernel1, kernel2 : gpytorch.kernels.Kernel
+        Factor kernels over ``x1`` / ``x2``. Fit in place, wrapped in a ScaleKernel if needed and
+        amplitude-scaled; ``kernel1`` ends unit-variance, ``kernel2`` carries the total variance.
+    dims : tuple of int, optional
+        The two GP axes of ``data`` for (``kernel1``, ``kernel2``) respectively (default (-2, -1)).
+    rescale : bool, optional
+        If True (default), rescale the kernels so that the composite kernel variance
+        match the data variance multiplied by var_mult.
+    var_mult : float, optional
+        Multiple of the empirical data variance to put into the composite kernel (default 1.0 =
+        match ``data.var()`` exactly). Use ``< 1`` for a signal amplitude below the data variance
+        (e.g. to leave out the noise contribution), ``> 1`` for above.
+    nsamp, iters, opt, method
+        Forwarded to the two per-axis :func:`fit_axis_kernel` calls (``iters=0`` sets only the
+        amplitude, leaving the passed-in lengthscales untouched).
+    prior_draws : int, optional
+        Number of 1D prior draws per factor used to estimate its variance for the unit/total
+        rescaling (default 100).
+    generator : torch.Generator, optional
+        RNG for the variance-estimation draws.
+
+    Returns
+    -------
+    kernel1, kernel2 : gpytorch.kernels.Kernel
+        The fitted, ScaleKernel-wrapped factor kernels (``kernel1`` unit variance, ``kernel2``
+        carrying the composite variance), ready for :func:`posterior_mean_2d` / :func:`inpaint_2d`.
+    """
+    from .kernels import ScaleKernel
+    d1, d2 = dims
+
+    # 1) two independent 1D axis fits (rescale=False: fit lengthscales only -- the 2D unit/total
+    # amplitude split below does the rescaling, so inner rescaling would double-count / be redundant)
+    fit_axis_kernel(data, flags, noise, x1, kernel1, dim=d1, nsamp=nsamp, iters=iters, opt=opt, method=method, rescale=False)
+    fit_axis_kernel(data, flags, noise, x2, kernel2, dim=d2, nsamp=nsamp, iters=iters, opt=opt, method=method, rescale=False)
+
+    # check if each kernel's outer layer is a ScaleKernel
+    # if not, wrap in ScaleKernel
+    if not isinstance(kernel1, ScaleKernel):
+        p = next(kernel1.parameters(), None)
+        kernel1 = ScaleKernel(kernel1)
+        if p is not None:
+            kernel1 = kernel1.to(dtype=p.dtype, device=p.device)
+    if not isinstance(kernel2, ScaleKernel):
+        p = next(kernel2.parameters(), None)
+        kernel2 = ScaleKernel(kernel2)
+        if p is not None:
+            kernel2 = kernel2.to(dtype=p.dtype, device=p.device)
+
+    if rescale:
+        # draw prior from each kernel to get their respective total variance
+        s1 = prior_draws_1d(kernel1, x1, size=prior_draws, jitter=1e-10, generator=generator).var()
+        s2 = prior_draws_1d(kernel2, x2, size=prior_draws, jitter=1e-10, generator=generator).var()
+
+        # scale kernel1 to unit variance, and kernel2 to carry the whole composite variance
+        kernel1.outputscale = kernel1.outputscale / s1
+        kernel2.outputscale = kernel2.outputscale / s2 * data[~flags.expand(data.shape)].var() * var_mult
+
+    return kernel1, kernel2
 
 
 def _sum_log_priors(module):
@@ -772,7 +880,23 @@ def batched_log_prob(C, noise, y, method='woodbury', rcond=1e-15):
                 + 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1).real).sum(-1)
     if method == 'cholesky':
         A = C.unsqueeze(0) + torch.diag_embed(noise.to(C.dtype))       # (b, n, n)
-        L = torch.linalg.cholesky(A)
+        try:
+            L = torch.linalg.cholesky(A)
+        except torch.linalg.LinAlgError:
+            # a sampled kernel matrix can be marginally non-PSD (e.g. a Sinc/composite axis whose
+            # covariance dips slightly negative); lift the diagonal by a growing jitter tied to the
+            # kernel's own scale until it factors (the fit is insensitive to a jitter this small)
+            eye = torch.eye(A.shape[-1], dtype=A.dtype, device=A.device)
+            base = C.diagonal(dim1=-2, dim2=-1).real.mean().clamp_min(1e-30)
+            L = None
+            for p in range(-6, 1):
+                try:
+                    L = torch.linalg.cholesky(A + base * 10.0 ** p * eye)
+                    break
+                except torch.linalg.LinAlgError:
+                    continue
+            if L is None:
+                raise
         alpha = torch.cholesky_solve(y.unsqueeze(-1), L).squeeze(-1)
         logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1).real).sum(-1)
 
