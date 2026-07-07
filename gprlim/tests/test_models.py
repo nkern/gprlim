@@ -495,9 +495,10 @@ def test_posterior_mean_pred_kernel():
 
 
 def test_precond_blockdiag_matches_eigen():
-    """The 'blockdiag' CG preconditioner returns the SAME posterior mean as the default 'eigen'
-    one (to cg_tol) for separable, non-separable, and mixed flag patterns, and reverts to 'eigen'
-    bit-for-bit when no whole channel is flagged. A preconditioner never changes the solution."""
+    """The 'blockdiag' and 'sparse_blockdiag' CG preconditioners return the SAME posterior mean as
+    the default 'eigen' one (to cg_tol) for separable, non-separable, and mixed flag patterns, and
+    'blockdiag' reverts to 'eigen' bit-for-bit when no whole channel is flagged. A preconditioner
+    never changes the solution."""
     torch.manual_seed(0)
     Nb, N1, N2 = 2, 50, 64
     x1 = torch.linspace(0, 25, N1, dtype=torch.float64)
@@ -515,7 +516,9 @@ def test_precond_blockdiag_matches_eigen():
     for name, noise in [('separable', sep), ('scatter', scat), ('mixed', mixed)]:
         m_eig = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='eigen', **kw)[0]
         m_bd = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='blockdiag', **kw)[0]
+        m_sp = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='sparse_blockdiag', **kw)[0]
         assert torch.allclose(m_bd, m_eig, atol=1e-4), (name, (m_bd - m_eig).abs().max())
+        assert torch.allclose(m_sp, m_eig, atol=1e-4), ('sparse', name, (m_sp - m_eig).abs().max())
 
     # no fully-flagged channel -> blockdiag reverts to eigen exactly (bit-for-bit)
     m_eig = posterior_mean_2d(k1, k2, x1, x2, y, scat, precond='eigen', **kw)[0]

@@ -1130,7 +1130,7 @@ def to_eigen(kernel, x, unravel=False, rcond=1e-12):
 def default_time_kernel(
     freqs, bl_vec, lat, buffer=None, hw_mult=1.0, min_hw=0.5,
     ml_scale=1e2, fz_scale=1e-1, fr_scale=3e-3,
-    only_amp=True, only_global_amp=False, negate=True
+    only_amp=True, only_global_amp=False, parameter=True, flip_sign=False
     ):
     r"""
     Default complex time (fringe-rate) kernel for a baseline, a sum of three components:
@@ -1184,17 +1184,17 @@ def default_time_kernel(
     only_global_amp : bool, optional
         If True, freeze all parameters expect for a single global ScaleKernel parameter.
         Supersedes only_amp.
-    negate : bool, optional
-        If True (default) negate ``bl_vec``, flipping the sign of the computed fringe
-        rates so a covariance draw's fringe-rate spectrum lands at the physical (not
-        mirror) rate under the numpy/torch FFT convention used by :class:`CarrierKernel`.
+    parameter : bool, optional
+        If True, leave kernel attached to parameter, otherwise remove all parameters.
+    flip_sign : bool, optional
+        If True, flip the sign of the Fourier convention of times -> fringe-rate.
 
     Returns
     -------
     gpytorch.kernels.Kernel
         The complex Hermitian time-kernel mixture (takes time in seconds).
     """
-    if negate:
+    if flip_sign:
         bl_vec = -bl_vec
 
     ## Main Lobe Kernel
@@ -1250,14 +1250,14 @@ def default_time_kernel(
     )
 
     # fix parameters if needed
-    if only_amp or only_global_amp:
+    if only_amp or only_global_amp or not parameter:
         ml.raw_tau.requires_grad_(False)
         ml.base_kernel.raw_lengthscale.requires_grad_(False)
         fz.base_kernel.raw_lengthscale.requires_grad_(False)
         sinc.raw_tau.requires_grad_(False)
         sinc.base_kernel.base_kernel.raw_lengthscale.requires_grad_(False)
 
-    if only_global_amp:
+    if only_global_amp or not parameter:
         # also fix scale parameters
         sinc.base_kernel.raw_outputscale.requires_grad_(False)
         fz.raw_outputscale.requires_grad_(False)
@@ -1271,18 +1271,22 @@ def default_time_kernel(
     )
     k.outputscale = ml_scale
 
+    if not parameter:
+        k.raw_outputscale.requires_grad_(False)
+
     return k
 
 
 def default_freq_kernel(
     bl_vec, ml_scale=1e2, pf_scale=1e-1, wd_scale=1e-3, lk_scale=1e-3, lk_kern='twinrbf',
-    buffer=150.0, min_delay=50.0, only_amp=True, only_global_amp=False, real=True):
+    buffer=150.0, min_delay=50.0, only_amp=True, only_global_amp=False, pf_real=True,
+    parameter=True):
     r"""
     Default frequency kernel composed of
 
     1. RBFKernel for main lobe centered at delay = 0 ns
-    2. pitchfork at +/- baseline horizon: a real TwinRBFKernel (``real=True``,
-       default) or two CarrierKernel(RBFKernel) (``real=False``)
+    2. pitchfork at +/- baseline horizon: a real TwinRBFKernel (``pf_real=True``,
+       default) or two CarrierKernel(RBFKernel) (``pf_real=False``)
     3. SincKernel for -horizon < delays < horizon
     4. SincKernel for supra-horizon leakage or a wide
        TwinRBFKernel at pitchfork delays.
@@ -1294,9 +1298,9 @@ def default_freq_kernel(
     a delay in microseconds and a SincKernel of lengthscale ``l`` has a brick-wall
     delay band of +/- 1 / (2 l). The horizon delay |b| / c comes from
     :func:`gprlim.utils.sky_delay` (returned in ns, converted to us here). The
-    pitchfork covers the symmetric +/- horizon pair: with ``real=True`` (default) a
+    pitchfork covers the symmetric +/- horizon pair: with ``pf_real=True`` (default) a
     single real ``TwinRBFKernel`` (Gaussian-windowed cosine), so the whole kernel is
-    real-valued; with ``real=False`` two ``CarrierKernel``s (one per sign), giving a
+    real-valued; with ``pf_real=False`` two ``CarrierKernel``s (one per sign), giving a
     complex-dtype (Hermitian, zero-imaginary) kernel for the complex solver.
 
     Parameters
@@ -1328,12 +1332,14 @@ def default_freq_kernel(
     only_global_amp : bool, optional
         If True, freeze all parameters expect for a single global ScaleKernel parameter.
         Supersedes only_amp.
-    real : bool, optional
+    pf_real : bool, optional
         If True (default) model the pitchfork with one real ``TwinRBFKernel``, so the
         returned kernel is real-valued (use it with the real GP / real-imag-stacked
         path). If False, use two ``CarrierKernel``s and return a complex-dtype kernel
         (use the complex solver).
-
+    parameter : bool, optional
+        If True, leave kernel attached to parameter, otherwise remove all parameters.
+ 
     Returns
     -------
     kernel mixture
@@ -1360,7 +1366,7 @@ def default_freq_kernel(
     ml.lengthscale = ls_main
 
     ## 2. Pitchfork: symmetric +/- horizon band, amplitude relative to the main lobe
-    if real:
+    if pf_real:
         # single real TwinRBFKernel (Gaussian-windowed cosine) -> kernel stays real
         pf = ScaleKernel(
             TwinRBFKernel(lengthscale_constraint=Interval(0, 1e3),
@@ -1431,9 +1437,9 @@ def default_freq_kernel(
         supra_k.outputscale = lk_scale
 
     # deactivate parameters if desired
-    if only_amp or only_global_amp:
+    if only_amp or only_global_amp or not parameter:
         ml.raw_lengthscale.requires_grad_(False)
-        if real:
+        if pf_real:
             pf.base_kernel.raw_lengthscale.requires_grad_(False)
             pf.base_kernel.raw_tau.requires_grad_(False)
         else:
@@ -1444,8 +1450,8 @@ def default_freq_kernel(
         wedge.base_kernel.raw_lengthscale.requires_grad_(False)
         supra_k.base_kernel.raw_lengthscale.requires_grad_(False)
 
-    if only_global_amp:
-        if real:
+    if only_global_amp or not parameter:
+        if pf_real:
             pf.raw_outputscale.requires_grad_(False)
         else:
             pf.kernels[0].raw_outputscale.requires_grad_(False)
@@ -1460,6 +1466,9 @@ def default_freq_kernel(
         outputscale_prior=LogNormalPrior(np.log(ml_scale), 5.0),
     )
     k.outputscale = ml_scale
+
+    if not parameter:
+        k.raw_outputscale.requires_grad_(False)
 
     return k
 

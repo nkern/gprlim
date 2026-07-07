@@ -130,3 +130,22 @@ def test_carrier_kernel_wirtinger_autograd():
 		k.raw_tau.data += eps
 	fd = (lp - lm) / (2 * eps)
 	assert abs(float(g) - fd) < 1e-4 * abs(fd)
+
+
+def test_default_freq_kernel():
+	# composite frequency (delay) kernel. pf_real=True -> a real-valued kernel (a real TwinRBF
+	# pitchfork); pf_real=False -> a complex-dtype kernel (the +/- horizon CarrierKernels sum to a
+	# real cosine, so it is Hermitian PSD with ~zero imaginary part). Both are valid covariances.
+	bl_vec = torch.tensor([[14.6, 0.0, 0.0]], dtype=torch.float64)   # ENU baseline [m]
+	nu = torch.linspace(120, 180, 48, dtype=torch.float64)          # frequency [MHz]
+
+	for pf_real in (True, False):
+		k = kernels.default_freq_kernel(bl_vec, pf_real=pf_real).double()
+		K = k(nu[:, None]).to_dense().detach()
+		assert K.shape == (48, 48)
+		assert K.is_complex() == (not pf_real)                      # pf_real -> real dtype, else complex
+		assert torch.allclose(K, K.conj().transpose(-1, -2))        # Hermitian / symmetric
+		assert torch.linalg.eigvalsh(K).min() > -1e-6 * K.diagonal().real.abs().max()   # PSD
+		if not pf_real:
+			# +/- horizon carriers cancel -> real-valued despite the complex dtype
+			assert K.imag.abs().max() < 1e-8 * K.real.abs().max()

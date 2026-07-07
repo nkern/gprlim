@@ -373,6 +373,69 @@ def kron_blockdiag_preconditioner(Ct, Cf, Df):
     return apply_Minv
 
 
+def kron_sparse_blockdiag_preconditioner(Ct, Cf, Df, rcond=1e-12):
+    r"""
+    Low-rank ("sparse") variant of :func:`kron_blockdiag_preconditioner` for
+    ``M = Ct (x) Cf + I (x) diag(Df)`` -- the SAME preconditioner, but applied as a cheap diagonal
+    background plus a rank-``(r_t*r_f)`` correction touching only the signal modes, so the apply
+    costs ``O(Ntimes*Nfreqs*(r_t+r_f))`` instead of ``O(Ntimes*Nfreqs*(Ntimes+Nfreqs))`` -- a large
+    per-iteration win when the kernels are low rank (smooth / band-limited).
+
+    In the block-diagonal form the per-block spectrum ``denom = lam_t (x) nu + 1`` is *exactly 1*
+    off the ``r_t x r_f`` signal block (null time modes have ``lam_t = 0``; null whitened-freq modes
+    have ``nu = 0``). Splitting ``1/denom = 1 + (1/denom - 1)`` gives
+
+        ``M^-1 r = r/Df  +  Q_t,r [ (Q_t,r^H R G_r^*) (x) (1/denom_r - 1) ] G_r^T``
+
+    -- a diagonal background ``r/Df`` (which carries the full-channel flags, same as
+    :func:`kron_blockdiag_preconditioner`) plus a correction over only the ``r_t`` time and ``r_f``
+    whitened-freq eigenmodes kept at ``rcond``. Exact in the limit ``rcond -> 0`` (all modes kept);
+    at a finite ``rcond`` it is a slightly weaker preconditioner, which (like any preconditioner)
+    changes only the CG iteration count, never the solution.
+
+    Parameters
+    ----------
+    Ct, Cf : tensor
+        Outer/time and inner/frequency kernels, Hermitian PSD (Ntimes, Ntimes) / (Nfreqs, Nfreqs).
+    Df : tensor
+        Per-inner-channel noise variance (Nfreqs,), strictly positive (fully-flagged channels
+        carry the large value).
+    rcond : float
+        Relative eigenvalue cutoff for the low-rank correction: keep time modes with
+        ``lam_t > rcond * lam_t_max`` and whitened-freq modes with ``nu > rcond * nu_max``. Smaller
+        keeps more modes (stronger preconditioner, costlier apply); larger is cheaper but may add
+        CG iterations. ``rcond -> 0`` recovers :func:`kron_blockdiag_preconditioner` exactly.
+
+    Returns
+    -------
+    callable
+        ``r -> M^-1 r`` on vectors of shape (..., Ntimes*Nfreqs).
+    """
+    dt = torch.promote_types(Ct.dtype, Cf.dtype)
+    Ct, Cf = Ct.to(dt), Cf.to(dt)
+    Ntimes, Nfreqs = Ct.shape[-1], Cf.shape[-1]
+    lam_t, Qt = torch.linalg.eigh(Ct)
+    lam_t = lam_t.clamp_min(0)
+    dinv = Df.rsqrt().to(dt)
+    nu, V = torch.linalg.eigh(dinv[:, None] * Cf * dinv[None, :])
+    nu = nu.clamp_min(0)
+    G = dinv[:, None] * V                                          # Df^-1/2 V, (Nfreqs, Nfreqs)
+    # keep only the signal modes; the correction (1/denom - 1) is ~0 on the rest, where denom ~= 1
+    kt = lam_t > lam_t[-1] * rcond
+    kf = nu > nu[-1] * rcond
+    Qt_r, G_r = Qt[:, kt].contiguous(), G[:, kf].contiguous()     # (Ntimes, r_t), (Nfreqs, r_f)
+    corr = 1.0 / (lam_t[kt][:, None] * nu[kf][None, :] + 1.0) - 1.0   # (r_t, r_f), the block eigenvalue shift
+    invDf = Df.reciprocal()
+    QtrH, Gc_r, GrT = Qt_r.conj().transpose(-1, -2), G_r.conj(), G_r.transpose(-1, -2)
+
+    def apply_Minv(r):
+        R = r.reshape(*r.shape[:-1], Ntimes, Nfreqs)
+        bg = R * invDf                                            # diagonal background (carries the flags)
+        Wc = ((QtrH @ R) @ Gc_r) * corr                          # project onto the r_t x r_f signal block, shift
+        return (bg + Qt_r @ (Wc @ GrT)).reshape(*r.shape[:-1], Ntimes * Nfreqs)   # + reconstruct
+    return apply_Minv
+
+
 # --------------------------------------------------------------------------------------
 # structured Kronecker matvec + high-level preconditioned-CG Wiener solve
 # --------------------------------------------------------------------------------------
@@ -405,8 +468,38 @@ def kron_matvec(Ct, Cf, diag=None):
     return mv
 
 
+def _lowrank_factor(C, rcond):
+    """Truncated eigen-factor ``A = Q sqrt(lam)`` -- columns for eigenvalues ``lam > rcond * lam_max``
+    -- so ``A A^H`` is the rank-truncated ``C`` (the low-rank half of :func:`kron_lowrank_matvec`)."""
+    lam, Q = torch.linalg.eigh(C)
+    keep = lam > lam[-1] * rcond
+    return Q[:, keep] * lam[keep].clamp_min(0).sqrt()
+
+
+def kron_lowrank_matvec(Ct, Cf, rcond, diag=None):
+    r"""
+    Low-rank matvec for ``A = (Ct (x) Cf)_r [+ diag]`` using the rank-truncated eigenfactorizations
+    ``Ct ~= A_t A_t^H``, ``Cf ~= A_f A_f^H`` (columns kept where the eigenvalue exceeds
+    ``rcond * lambda_max``): the identity ``(Ct X Cf^T)_r = A_t (A_t^H X A_f^*) A_f^T`` costs
+    ``O(Ntimes*Nfreqs*(r_t+r_f))`` vs :func:`kron_matvec`'s ``O(Ntimes*Nfreqs*(Ntimes+Nfreqs))`` -- a
+    big per-iteration CG win for low-rank (smooth / band-limited) kernels. Unlike :func:`kron_matvec`
+    this *truncates* the operator (accuracy set by ``rcond``; exact as ``rcond -> 0``, which keeps all
+    positive-eigenvalue modes). Parameters mirror :func:`kron_matvec` plus the ``rcond`` cutoff.
+    """
+    dt = torch.promote_types(Ct.dtype, Cf.dtype)
+    At, Af = _lowrank_factor(Ct, rcond).to(dt), _lowrank_factor(Cf, rcond).to(dt)
+    Ntimes, Nfreqs = Ct.shape[-1], Cf.shape[-1]
+    AtH, Afc, AfT = At.conj().transpose(-1, -2), Af.conj(), Af.transpose(-1, -2)
+
+    def mv(v):
+        X = v.reshape(*v.shape[:-1], Ntimes, Nfreqs)
+        out = (At @ ((AtH @ X) @ Afc) @ AfT).reshape(*v.shape[:-1], Ntimes * Nfreqs)
+        return out if diag is None else out + diag * v
+    return mv
+
+
 def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=None, n_threads=1,
-                   return_alpha=False, precond='eigen'):
+                   return_alpha=False, precond='eigen', sparse_rcond=1e-12):
     r"""
     Complex Wiener posterior mean  ``m = (Ct (x) Cf) (Ct (x) Cf + diag(noise))^-1 y``  via
     preconditioned CG: structured throughout (never densifies the ``(Ntimes*Nfreqs)^2``
@@ -433,8 +526,23 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
         outer axis (whole inner-axis channels flagged the same at every time), cutting CG to a
         handful of iterations. It builds the per-channel noise ``Df = min`` over the batch/outer
         axis and *reverts to 'eigen' automatically* when no channel is fully flagged, so it never
-        does more iterations than 'eigen'. Preconditioner choice does not change the solution
-        (both solve the true ``A`` to ``tol``), only the iteration count.
+        does more iterations than 'eigen'. Both 'eigen' and 'blockdiag' are pure preconditioners
+        (they never change the solution, only the iteration count). 'sparse_blockdiag' is different:
+        it applies the blockdiag preconditioner in low-rank form
+        (:func:`kron_sparse_blockdiag_preconditioner`) AND applies the signal operator itself in
+        low-rank form (:func:`kron_lowrank_matvec`), both truncated at ``sparse_rcond`` -- a much
+        cheaper per-iteration CG for low-rank (smooth / band-limited) kernels. Because it truncates
+        the *operator*, it is a low-rank (approximate) solve like :func:`kron_woodbury_predict`
+        rather than an exact one: the accuracy is set by ``sparse_rcond`` (validate in the science
+        space), exact as ``sparse_rcond -> 0``. The final mean is reconstructed at full rank.
+    sparse_rcond : float, optional
+        Relative eigenvalue cutoff for ``precond='sparse_blockdiag'`` (ignored otherwise): the
+        low-rank signal operator and preconditioner keep time / (whitened-)freq modes above
+        ``sparse_rcond * lambda_max``. Smaller keeps more modes (more accurate operator, stronger
+        preconditioner, fewer iterations, costlier apply; ``-> 0`` recovers the exact 'blockdiag'
+        solve); larger truncates more (cheaper apply, but a less accurate answer and possibly more
+        iterations). The default is tight so the answer and iteration count both track 'blockdiag';
+        loosen it only while the result and the returned ``iters`` stay acceptable. Default 1e-12.
     tol, max_iter, x0
         Forwarded to :func:`pcg`. The stop test uses the inverse-variance-weighted relative
         residual (``weight = 1/noise``), so high-variance flagged pixels drop out of it and
@@ -481,17 +589,41 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
         Df = noise.reshape(-1, Nfreqs).real.amin(dim=0)
         M = (kron_blockdiag_preconditioner(Ct, Cf, Df) if bool((Df > Df.amin()).any())
              else kron_eigen_preconditioner(Ct, Cf, shift=shift))
+    elif precond == 'sparse_blockdiag':
+        # low-rank blockdiag: a diagonal background (r/Df, which still carries the full-channel
+        # flags) plus a rank-(r_t*r_f) correction on only the signal modes kept at sparse_rcond --
+        # far cheaper per apply than 'blockdiag' when the kernels are low rank. Same Df.
+        Df = noise.reshape(-1, Nfreqs).real.amin(dim=0)
+        M = kron_sparse_blockdiag_preconditioner(Ct, Cf, Df, rcond=sparse_rcond)
     else:
-        raise ValueError(f"precond must be 'eigen' or 'blockdiag', got {precond!r}")
+        raise ValueError(f"precond must be 'eigen', 'blockdiag' or 'sparse_blockdiag', got {precond!r}")
+
+    # operator matvec A = (Ct (x) Cf) + diag(noise). For 'sparse_blockdiag' the signal is applied in
+    # its low-rank form (Ct (x) Cf)_r = A_t (A_t^H X A_f^*) A_f^T via truncated eigenfactors (built
+    # ONCE, shared across chunks) -- much cheaper per CG iteration, but it TRUNCATES the operator
+    # (accuracy set by sparse_rcond, exact as it -> 0), unlike the preconditioner which never
+    # changes the answer. The mean reconstruction below stays full-rank (done once).
+    if precond == 'sparse_blockdiag':
+        dtc = torch.promote_types(Ct.dtype, Cf.dtype)
+        At, Af = _lowrank_factor(Ct, sparse_rcond).to(dtc), _lowrank_factor(Cf, sparse_rcond).to(dtc)
+        AtH, Afc, AfT = At.conj().transpose(-1, -2), Af.conj(), Af.transpose(-1, -2)
+        def make_op(nf):
+            def mv(v):
+                X = v.reshape(*v.shape[:-1], Ntimes, Nfreqs)
+                out = (At @ ((AtH @ X) @ Afc) @ AfT).reshape(*v.shape[:-1], Ntimes * Nfreqs)
+                return out + nf * v
+            return mv
+    else:
+        def make_op(nf):
+            return kron_matvec(Ct, Cf, diag=nf)
 
     def solve(yf, nf, xf):
-        # alpha = (Ct (x) Cf + diag(noise))^-1 yf via preconditioned CG (A never densified),
-        # then the Wiener mean m = (Ct (x) Cf) alpha (one more structured matvec). The stop
-        # test is inverse-variance-weighted (weight=1/noise) so flagged pixels drop out of it
+        # alpha = (A + diag(noise))^-1 yf via preconditioned CG (A never densified), then the Wiener
+        # mean m = (Ct (x) Cf) alpha via a FULL-rank matvec (once, so the mean is not truncated). The
+        # stop test is inverse-variance-weighted (weight=1/noise) so flagged pixels drop out of it
         # and `tol` is independent of the flag-var/noise ratio.
-        a, inf = pcg(kron_matvec(Ct, Cf, diag=nf), yf, M=M, tol=tol, max_iter=max_iter, x0=xf,
-                     weight=nf.reciprocal())
-        # return alpha = (Ks+N)^-1 y (for prediction at new points) or the mean Ks alpha
+        a, inf = pcg(make_op(nf), yf, M=M, tol=tol, max_iter=max_iter, x0=xf, weight=nf.reciprocal())
+        # return alpha = (Ks+N)^-1 y (for prediction at new points) or the mean Ks alpha (full-rank)
         return (a if return_alpha else kron_matvec(Ct, Cf)(a)), inf
 
     # number of independent right-hand sides (e.g. baselines) on the leading axis

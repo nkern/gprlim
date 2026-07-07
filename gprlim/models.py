@@ -126,7 +126,7 @@ def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend
 def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=None,
                       C1_rcond=None, method='woodbury', mu=None, dims=(-2, -1), detrend=False,
                       rcond=1e-12, cg_tol=1e-4, cg_max_iter=5000, n_threads=1,
-                      pred_kernel1=None, pred_kernel2=None, precond='eigen'):
+                      pred_kernel1=None, pred_kernel2=None, precond='eigen', sparse_rcond=1e-12):
     """
     GP posterior mean for a separable 2D covariance ``K = C1 (x) C2`` (``C1 = kernel1`` over
     ``x1``, the slow/outer axis; ``C2 = kernel2`` over ``x2``), batched over the leading axis
@@ -178,11 +178,25 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
     rcond, cg_tol, cg_max_iter, n_threads
         Forwarded to the chosen structured solver.
     precond : str, optional
-        CG preconditioner (``method='cg'`` only): 'eigen' (default; scalar-shift) or 'blockdiag'
+        CG preconditioner (``method='cg'`` only): 'eigen' (default; scalar-shift) and 'blockdiag'
         (block-diagonal, exact for full-inner-channel flags -- far fewer CG iterations when whole
-        frequency channels are flagged, and auto-reverts to 'eigen' when none are, so it never
-        costs more). Does not change the result. See
-        :func:`gprlim.solvers.kron_blockdiag_preconditioner`.
+        frequency channels are flagged, auto-reverting to 'eigen' when none are) are pure
+        preconditioners that do NOT change the result. 'sparse_blockdiag' additionally applies the
+        signal *operator* in low-rank form (both the preconditioner and the matvec truncated at
+        ``sparse_rcond``) -- a much cheaper per-iteration CG for low-rank kernels, but a low-rank
+        (approximate) solve like ``method='woodbury'`` rather than an exact one (accuracy set by
+        ``sparse_rcond``, exact as it ``-> 0``). See
+        :func:`gprlim.solvers.kron_blockdiag_preconditioner` /
+        :func:`gprlim.solvers.kron_sparse_blockdiag_preconditioner` /
+        :func:`gprlim.solvers.kron_lowrank_matvec`.
+    sparse_rcond : float, optional
+        Relative eigenvalue cutoff for ``precond='sparse_blockdiag'`` (ignored otherwise): the
+        low-rank operator and preconditioner keep modes above ``sparse_rcond * lambda_max`` per axis.
+        Smaller keeps more modes (more accurate, stronger preconditioner, fewer iterations, costlier
+        apply; ``-> 0`` recovers the exact 'blockdiag' solve); larger truncates more (cheaper apply,
+        less accurate, possibly more iterations). The default tracks 'blockdiag' in both answer and
+        iteration count; loosen it only while the result and ``info['cg_iters']`` stay acceptable.
+        Default 1e-12.
 
     Returns
     -------
@@ -250,7 +264,8 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
             alpha = kron_woodbury_predict(C1, C2, nz, ys, rcond=rcond, return_alpha=True)
         elif method == 'cg':
             alpha, cg_info = kron_wiener_cg(C1, C2, nz, ys, tol=cg_tol, max_iter=cg_max_iter,
-                                            n_threads=n_threads, return_alpha=True, precond=precond)
+                                            n_threads=n_threads, return_alpha=True, precond=precond,
+                                            sparse_rcond=sparse_rcond)
             info['cg_iters'] = cg_info['iters']
         elif method == 'cholesky':
             nb = ys.shape[0]
@@ -320,7 +335,7 @@ def inpaint_1d(kernel, x, y, noise, flags, mu=None, dim=-1, detrend=False,
 
 def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, C1_rcond=None, mu=None, detrend=False,
                dims=(-2, -1), method='woodbury', rcond=1e-12, cg_tol=1e-4, cg_max_iter=5000,
-               n_threads=1, pred_kernel1=None, pred_kernel2=None, precond='eigen'):
+               n_threads=1, pred_kernel1=None, pred_kernel2=None, precond='eigen', sparse_rcond=1e-12):
     """
     Inpaint ``y`` at flagged pixels with the 2D GP posterior mean (separable ``C1 (x) C2``).
 
@@ -357,9 +372,11 @@ def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, C1_rcond=None, mu=None
         Separate prediction factor kernels for the model written into the gaps -- e.g. to inpaint
         a single signal component; default None reuses ``kernel1`` / ``kernel2``. See
         :func:`posterior_mean_2d`.
-    dims, method, rcond, cg_tol, cg_max_iter, n_threads, precond
+    dims, method, rcond, cg_tol, cg_max_iter, n_threads, precond, sparse_rcond
         Forwarded to :func:`posterior_mean_2d` (``dims`` = the two GP axes of ``y``). Use
-        ``precond='blockdiag'`` for a large CG speedup when whole frequency channels are flagged.
+        ``precond='blockdiag'`` for a large CG speedup when whole frequency channels are flagged,
+        or ``precond='sparse_blockdiag'`` (tuned by ``sparse_rcond``) for a cheaper per-iteration
+        apply when the kernels are low rank.
 
     Returns
     -------
@@ -371,7 +388,8 @@ def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, C1_rcond=None, mu=None
     mdl, _ = posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, C1_rcond=C1_rcond, mu=mu,
                                detrend=detrend, dims=dims, method=method, rcond=rcond, cg_tol=cg_tol,
                                cg_max_iter=cg_max_iter, n_threads=n_threads,
-                               pred_kernel1=pred_kernel1, pred_kernel2=pred_kernel2, precond=precond)
+                               pred_kernel1=pred_kernel1, pred_kernel2=pred_kernel2, precond=precond,
+                               sparse_rcond=sparse_rcond)
     return torch.where(flags, mdl, y), mdl
 
 

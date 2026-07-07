@@ -191,6 +191,43 @@ def test_kron_blockdiag_preconditioner_accelerates():
     assert bd["iters"] <= 2 and bd["iters"] < eig["iters"]
 
 
+@pytest.mark.parametrize("cplx", [False, True])
+def test_kron_sparse_blockdiag_preconditioner(cplx):
+    # low-rank form of the blockdiag preconditioner: with rcond=0 (all signal modes kept) it applies
+    # the SAME M^-1 as kron_blockdiag_preconditioner (background r/Df + full correction).
+    Nt, Nf = 7, 6
+    P, F = _kron_cores(Nt, Nf, cplx)
+    Df = 0.1 + torch.rand(Nf, dtype=DOUBLE)
+    v = _vec((3, Nt * Nf), cplx, 4)
+    full = solvers.kron_blockdiag_preconditioner(P, F, Df)
+    sparse0 = solvers.kron_sparse_blockdiag_preconditioner(P, F, Df, rcond=0.0)
+    assert (sparse0(v) - full(v)).abs().max() < 1e-8              # rcond=0 == full blockdiag apply
+
+    # end-to-end: precond='sparse_blockdiag' low-ranks BOTH the operator (matvec) and the
+    # preconditioner; at sparse_rcond=0 (all positive modes kept) both are exact, so the CG solve
+    # reaches the dense Wiener mean.
+    y = _vec((Nt, Nf), cplx, 9)
+    flags = torch.zeros(Nt, Nf, dtype=bool); flags[:, 2:4] = True   # a fully-flagged channel gap
+    noise = 0.1 * torch.ones(Nt, Nf, dtype=DOUBLE); noise[flags] = 1e6
+    m, info = solvers.kron_wiener_cg(P, F, noise, y, tol=1e-9, max_iter=2000,
+                                     precond='sparse_blockdiag', sparse_rcond=0.0)
+    assert torch.allclose(m, _dense_wiener(P, F, noise, y), atol=1e-5)
+    assert info["iters"] < 2000                                    # converged
+
+
+@pytest.mark.parametrize("cplx", [False, True])
+def test_kron_lowrank_matvec(cplx):
+    # low-rank matvec == dense kron_matvec at rcond=0 (all positive-eigenvalue modes kept, so
+    # A_t A_t^H (x) A_f A_f^H reproduces Ct (x) Cf exactly); rcond > 0 truncates the operator.
+    Nt, Nf = 7, 6
+    P, F = _kron_cores(Nt, Nf, cplx)
+    v = _vec((3, Nt * Nf), cplx, 5)
+    diag = 0.1 + torch.rand(Nt * Nf, dtype=DOUBLE)
+    dense = solvers.kron_matvec(P, F, diag=diag)
+    lr = solvers.kron_lowrank_matvec(P, F, 0.0, diag=diag)
+    assert (dense(v) - lr(v)).abs().max() < 1e-8                    # rcond=0 == dense matvec
+
+
 # --------------------------------------------------------------------------------------
 # high-level kron_wiener_cg: kron-sparse solve == dense model, real and complex
 # --------------------------------------------------------------------------------------

@@ -6,43 +6,32 @@ _SPEED_OF_LIGHT = 299_792_458.0      # m / s
 _SDAY_SEC       = 86_164.0905        # sidereal day [s]  (astropy: units.sday.to("s"))
 
 
-def detect_contiguous(flags, width, axis):
+def detect_contiguous(flags, width, dim=-1):
     """
     Detect a contiguous block of flags
     
     Parameters
     ----------
-    flags : ndarray
+    flags : tensor
         Boolean flags
     width : int
         Minimum width of contiguous flags to detect
-    axis : int
+    dim : int
         Axis of flags to detect contiguous flags over
-        
+
     Returns
     -------
-    ndarray
+    tensor
     """
-    f = np.asarray(np.take(flags, 0, axis=axis), dtype=int)
-    wide_flags = np.zeros_like(flags)
-    idx = [slice(None) for i in range(flags.ndim)]
-    for i in range(1, flags.shape[axis]):
-        # add current flags to counter
-        f += np.take(flags, i, axis=axis)
-        
-        # if unflagged, restart counter
-        f *= np.take(flags, i, axis=axis)
-        
-        # check if counter is above width, update wide_flags
-        if i < width - 1:
-            pass
-        else:
-            for j in range(0, width):
-                idx[axis] = i - j
-                wide_flags[*idx] += f >= width
+    if flags.size(dim) < width:
+        # keepdim to match the main path (a length-1 `dim`), so the result broadcasts against flags
+        return torch.zeros_like(flags.narrow(dim, 0, 1), dtype=torch.bool)
+    c = flags.to(torch.int32).cumsum(dim)
+    c = torch.cat([torch.zeros_like(c.narrow(dim, 0, 1)), c], dim)   # prepend zero
+    n = c.size(dim)
+    win = c.narrow(dim, width, n - width) - c.narrow(dim, 0, n - width)
 
-    return wide_flags
-
+    return (win == width).any(dim, keepdim=True)
 
 def empirical_cov(X, flags=None, weights=None, mean_subtract=True, min_weight=1.0):
     """
@@ -145,7 +134,7 @@ def sky_frate_range(freqs, bl_vecs, lat):
     bl_en  = bl_vecs[:, :2].norm(dim=-1)                          # (Nbls,) East-North length [m]
     sinlat = np.sin(np.abs(np.radians(lat)))               # scalar
     blcos  = bl_vecs[:, 0] / bl_en.clamp_min(1e-30)              # (Nbls,) cos(angle from East)
-    amp    = bl_en * 2 * np.pi / (_SDAY_SEC * 1e-3) / _SPEED_OF_LIGHT   # (Nbls,) per-Hz; 1e-3 -> mHz
+    amp    = -bl_en * 2 * np.pi / (_SDAY_SEC * 1e-3) / _SPEED_OF_LIGHT   # (Nbls,) per-Hz; 1e-3 -> mHz
 
     big   = amp * torch.sqrt(sinlat**2 + blcos**2 * (1 - sinlat**2))   # (Nbls,)
     small = amp * sinlat                                                # (Nbls,)
@@ -233,7 +222,7 @@ def zenith_frate(freqs, bl_vecs, latitude):
     freqs  = torch.atleast_1d(torch.as_tensor(freqs))
     bl_vecs = torch.atleast_2d(torch.as_tensor(bl_vecs))
     b_E = bl_vecs[:, 0]                                    # only East fringes at zenith
-    df = b_E * np.cos(np.radians(latitude)) * 2 * np.pi / (_SDAY_SEC * 1e-3) / _SPEED_OF_LIGHT
+    df = -b_E * np.cos(np.radians(latitude)) * 2 * np.pi / (_SDAY_SEC * 1e-3) / _SPEED_OF_LIGHT
 
     return df[:, None] * freqs
 
