@@ -73,6 +73,9 @@ def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend
     -------
     tensor
         Posterior mean: ``y`` with its ``dim`` axis replaced by length Npred.
+    info : dict
+        Solver diagnostics; empty for the 1D path (present for API parity with
+        :func:`posterior_mean_2d`, whose ``method='cg'`` reports ``cg_iters``).
     """
     if dim == 0:
         raise ValueError("dim must not be 0 (the batch axis); use a non-zero / negative dim.")
@@ -117,7 +120,7 @@ def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend
             pred = gpr_invert(Cs, nf, B=Cp, y=yc, rcond=rcond, method=method, chunk=chunk)
         pred = pred + mu_pred + trend
 
-    return pred.reshape(*lead, pred.shape[-1]).movedim(-1, dim)
+    return pred.reshape(*lead, pred.shape[-1]).movedim(-1, dim), {}
 
 
 def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=None,
@@ -185,6 +188,10 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
     -------
     tensor
         Posterior mean, shape (Nbatch, Nx1, Nx2) (or (Nbatch, Npred1, Npred2) for pred grids).
+    info : dict
+        Solver diagnostics. For ``method='cg'`` holds ``cg_iters`` -- the number of CG
+        iterations (the worst over batch chunks for a parallel ``n_threads`` run). Empty
+        for the 'woodbury' / 'cholesky' methods.
     """
     new_points = pred_x1 is not None or pred_x2 is not None
     if new_points and C1_rcond:
@@ -238,11 +245,13 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
             ys, nz = yc, nf
 
         # solve for alpha = (Ks + diag(noise))^-1 ys  (Ks = C1 (x) C2), structured per method
+        info = {}
         if method == 'woodbury':
             alpha = kron_woodbury_predict(C1, C2, nz, ys, rcond=rcond, return_alpha=True)
         elif method == 'cg':
-            alpha, _ = kron_wiener_cg(C1, C2, nz, ys, tol=cg_tol, max_iter=cg_max_iter,
-                                      n_threads=n_threads, return_alpha=True, precond=precond)
+            alpha, cg_info = kron_wiener_cg(C1, C2, nz, ys, tol=cg_tol, max_iter=cg_max_iter,
+                                            n_threads=n_threads, return_alpha=True, precond=precond)
+            info['cg_iters'] = cg_info['iters']
         elif method == 'cholesky':
             nb = ys.shape[0]
             alpha = gpr_invert(torch.kron(C1, C2), nz.reshape(nb, -1), y=ys.reshape(nb, -1),
@@ -255,7 +264,7 @@ def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=
         mm = torch.einsum('pt,rtf,qf->rpq', Bp1, alpha, Bp2)
         pred = (unstack_ri(mm) if split else mm) + mu_pred + trend
 
-    return pred.reshape(*lead, *pred.shape[-2:]).movedim((-2, -1), dims)
+    return pred.reshape(*lead, *pred.shape[-2:]).movedim((-2, -1), dims), info
 
 
 def inpaint_1d(kernel, x, y, noise, flags, mu=None, dim=-1, detrend=False,
@@ -304,8 +313,8 @@ def inpaint_1d(kernel, x, y, noise, flags, mu=None, dim=-1, detrend=False,
     mdl : tensor
         The full posterior-mean model over the grid (same shape/dtype as ``y``).
     """
-    mdl = posterior_mean_1d(kernel, x, y, noise, mu=mu, dim=dim, detrend=detrend,
-                            rcond=rcond, method=method, chunk=chunk, pred_kernel=pred_kernel)
+    mdl, _ = posterior_mean_1d(kernel, x, y, noise, mu=mu, dim=dim, detrend=detrend,
+                               rcond=rcond, method=method, chunk=chunk, pred_kernel=pred_kernel)
     return torch.where(flags, mdl, y), mdl
 
 
@@ -359,10 +368,10 @@ def inpaint_2d(kernel1, kernel2, x1, x2, y, noise, flags, C1_rcond=None, mu=None
     mdl : tensor
         The full posterior-mean model on the (x1, x2) grid (same shape/dtype as ``y``).
     """
-    mdl = posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, C1_rcond=C1_rcond, mu=mu,
-                            detrend=detrend, dims=dims, method=method, rcond=rcond, cg_tol=cg_tol,
-                            cg_max_iter=cg_max_iter, n_threads=n_threads,
-                            pred_kernel1=pred_kernel1, pred_kernel2=pred_kernel2, precond=precond)
+    mdl, _ = posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, C1_rcond=C1_rcond, mu=mu,
+                               detrend=detrend, dims=dims, method=method, rcond=rcond, cg_tol=cg_tol,
+                               cg_max_iter=cg_max_iter, n_threads=n_threads,
+                               pred_kernel1=pred_kernel1, pred_kernel2=pred_kernel2, precond=precond)
     return torch.where(flags, mdl, y), mdl
 
 
@@ -545,8 +554,8 @@ def posterior_draws_1d(kernel, x, y, noise, mu=None, size=1, dim=-1, jitter=1e-1
             f_prior = f_prior + mu(x[:, None])                   # prior carries the mean
         eps = np_.sqrt() * _conv_normal((size, *lead, n), y.is_complex(), cov_c, y.real.dtype, y.device, generator)
         resid = yp.unsqueeze(0) - f_prior - eps                  # (size, *lead, n)
-        corr = posterior_mean_1d(kernel, x, resid, np_.unsqueeze(0).expand(size, *np_.shape),
-                                 dim=-1, rcond=rcond, method=method, chunk=chunk)
+        corr, _ = posterior_mean_1d(kernel, x, resid, np_.unsqueeze(0).expand(size, *np_.shape),
+                                    dim=-1, rcond=rcond, method=method, chunk=chunk)
         f_post = f_prior + corr
     return f_post.movedim(-1, dim + 1 if dim >= 0 else dim)      # restore y's axis order (+ size)
 
@@ -623,9 +632,10 @@ def posterior_draws_2d(kernel1, kernel2, x1, x2, y, noise, mu=None, size=1, C1_r
         eps = nf.sqrt() * _conv_normal((size, Nb, n1, n2), y.is_complex(), cov_c, y.real.dtype, y.device, generator)
         resid = (yf.unsqueeze(0) - f_prior - eps).reshape(size * Nb, n1, n2)
         nr = nf.unsqueeze(0).expand(size, Nb, n1, n2).reshape(size * Nb, n1, n2)
-        corr = posterior_mean_2d(kernel1, kernel2, x1, x2, resid, nr, C1_rcond=C1_rcond, method=method,
-                                 rcond=rcond, cg_tol=cg_tol, cg_max_iter=cg_max_iter,
-                                 n_threads=n_threads).reshape(size, Nb, n1, n2)
+        corr, _ = posterior_mean_2d(kernel1, kernel2, x1, x2, resid, nr, C1_rcond=C1_rcond, method=method,
+                                    rcond=rcond, cg_tol=cg_tol, cg_max_iter=cg_max_iter,
+                                    n_threads=n_threads)
+        corr = corr.reshape(size, Nb, n1, n2)
         out = (f_prior + corr).reshape(size, *lead, n1, n2)
     dest = tuple(d + 1 if d >= 0 else d for d in dims)            # +1 for the prepended size axis
     return out.movedim((-2, -1), dest)

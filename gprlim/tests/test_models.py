@@ -297,35 +297,35 @@ def test_posterior_mean_1d():
     yr = torch.randn(B, Nx, dtype=torch.float64)
 
     # complex data + real kernel -> auto-split, matches the promoted-complex dense solve
-    out = posterior_mean_1d(kr, x, y, noise)
+    out = posterior_mean_1d(kr, x, y, noise)[0]
     assert out.dtype == torch.cdouble
     assert torch.allclose(out, dense_ref(K.to(torch.cdouble), K.to(torch.cdouble), y, noise), atol=1e-9)
 
     # complex data + complex kernel -> solved directly
-    out_c = posterior_mean_1d(kc, x, y, noise)
+    out_c = posterior_mean_1d(kc, x, y, noise)[0]
     assert torch.allclose(out_c, dense_ref(Kc, Kc, y, noise), atol=1e-9)
 
     # real data + real kernel
-    out_r = posterior_mean_1d(kr, x, yr, noise)
+    out_r = posterior_mean_1d(kr, x, yr, noise)[0]
     assert torch.allclose(out_r, dense_ref(K, K, yr, noise), atol=1e-9)
 
     # dim != -1: sample axis in the middle of a 3-D y; matches looping the 2-D solve
     y3 = torch.randn(B, Nx, 5, dtype=torch.cdouble)
     n3 = 0.1 + torch.rand(B, Nx, 5, dtype=torch.float64)
-    out3 = posterior_mean_1d(kr, x, y3, n3, dim=1)
+    out3 = posterior_mean_1d(kr, x, y3, n3, dim=1)[0]
     assert out3.shape == y3.shape
     for k in range(5):
-        assert torch.allclose(out3[:, :, k], posterior_mean_1d(kr, x, y3[:, :, k], n3[:, :, k]), atol=1e-12)
+        assert torch.allclose(out3[:, :, k], posterior_mean_1d(kr, x, y3[:, :, k], n3[:, :, k])[0], atol=1e-12)
 
     # pred_x at new points + a mean function (mu)
     pred_x = torch.linspace(0, 10, 6, dtype=torch.float64)
-    outp = posterior_mean_1d(kr, x, yr, noise, pred_x=pred_x, mu=mean)
+    outp = posterior_mean_1d(kr, x, yr, noise, pred_x=pred_x, mu=mean)[0]
     Cp = kr(pred_x[:, None], x[:, None]).to_dense().detach()
     assert outp.shape == (B, 6)
     assert torch.allclose(outp, dense_ref(K, Cp, yr - const, noise, const), atol=1e-9)
 
     # detrend: subtract the per-row inverse-noise-weighted mean before the solve, add it back
-    out_d = posterior_mean_1d(kr, x, y, noise, detrend=True)
+    out_d = posterior_mean_1d(kr, x, y, noise, detrend=True)[0]
     Kc2 = K.to(torch.cdouble)
     ref_d = torch.empty_like(y)
     for i in range(B):
@@ -367,27 +367,27 @@ def test_posterior_mean_2d():
     for method in ('woodbury', 'cg', 'cholesky'):
         # complex covariance -> solved directly
         outc = posterior_mean_2d(k1c, k2, x1, x2, y, noise, method=method,
-                                 rcond=1e-12, cg_tol=1e-11, cg_max_iter=3000)
+                                 rcond=1e-12, cg_tol=1e-11, cg_max_iter=3000)[0]
         assert outc.dtype == torch.cdouble and outc.shape == y.shape
         assert torch.allclose(outc, dense_ref(C1c), atol=1e-6), method
         # real covariance + complex data -> real/imag split
         outr = posterior_mean_2d(k1r, k2, x1, x2, y, noise, method=method,
-                                 rcond=1e-12, cg_tol=1e-11, cg_max_iter=3000)
+                                 rcond=1e-12, cg_tol=1e-11, cg_max_iter=3000)[0]
         assert torch.allclose(outr, dense_ref(C1r), atol=1e-6), ('split', method)
 
     # C1_rcond spectrum-shrinkage: matches a dense solve with the spectrum-shrunk outer factor
-    out_e = posterior_mean_2d(k1c, k2, x1, x2, y, noise, C1_rcond=1e-2, method='cholesky')
+    out_e = posterior_mean_2d(k1c, k2, x1, x2, y, noise, C1_rcond=1e-2, method='cholesky')[0]
     assert torch.allclose(out_e, dense_ref(shrink(C1c, 1e-2)), atol=1e-6)
     # C1_rcond=1 flattens C1 to a scaled identity -> the 2D solve IS the per-x1 1D inpaint along x2
     kflat = kernels.ScaleKernel(kernels.RBFKernel()).double()
     kflat.base_kernel.lengthscale = 15.0; kflat.outputscale = 1.0
-    out_1d = posterior_mean_2d(kflat, k2, x1, x2, y, noise, C1_rcond=1.0, method='cholesky')
-    ref_1d = torch.stack([posterior_mean_1d(k2, x2, y[b], noise[b]) for b in range(Nb)])
+    out_1d = posterior_mean_2d(kflat, k2, x1, x2, y, noise, C1_rcond=1.0, method='cholesky')[0]
+    ref_1d = torch.stack([posterior_mean_1d(k2, x2, y[b], noise[b])[0] for b in range(Nb)])
     assert torch.allclose(out_1d, ref_1d, atol=1e-6)
 
     # mu (2D mean fn) + detrend: subtract both before the solve, add both back to the prediction
     muf = lambda a, b: torch.full((a.shape[0], b.shape[0]), 0.3 + 0.2j, dtype=torch.cdouble)
-    out_m = posterior_mean_2d(k1c, k2, x1, x2, y, noise, mu=muf, detrend=True, method='cholesky')
+    out_m = posterior_mean_2d(k1c, k2, x1, x2, y, noise, mu=muf, detrend=True, method='cholesky')[0]
     mu_x = muf(x1[:, None], x2[:, None])
     Ks = torch.kron(C1c.to(torch.cdouble), C2.to(torch.cdouble))
     ref_m = torch.empty_like(y)
@@ -401,7 +401,7 @@ def test_posterior_mean_2d():
 
     # dims=: the 2D axes need not be the last two -- remap via dims and round-trip
     yp, np_ = y.permute(1, 2, 0).contiguous(), noise.permute(1, 2, 0).contiguous()   # (N1,N2,Nb)
-    out_p = posterior_mean_2d(k1c, k2, x1, x2, yp, np_, dims=(0, 1), method='cholesky')
+    out_p = posterior_mean_2d(k1c, k2, x1, x2, yp, np_, dims=(0, 1), method='cholesky')[0]
     assert out_p.shape == (N1, N2, Nb)
     assert torch.allclose(out_p, dense_ref(C1c).permute(1, 2, 0), atol=1e-6)
 
@@ -423,15 +423,15 @@ def test_posterior_mean_2d():
     ref_pc = dense_pred(C1c, Cp1c)
     for method in ('woodbury', 'cg', 'cholesky'):
         outp = posterior_mean_2d(k1c, k2, x1, x2, y, noise, pred_x1=px1, pred_x2=px2,
-                                 method=method, rcond=1e-12, cg_tol=1e-11, cg_max_iter=3000)
+                                 method=method, rcond=1e-12, cg_tol=1e-11, cg_max_iter=3000)[0]
         assert outp.shape == (Nb, 4, 5), (method, outp.shape)
         assert torch.allclose(outp, ref_pc, atol=1e-6), method
     # real covariance (split path) predicts too
     Cp1r = k1r(px1[:, None], x1[:, None]).to_dense().detach()
-    outr = posterior_mean_2d(k1r, k2, x1, x2, y, noise, pred_x1=px1, pred_x2=px2, method='cholesky')
+    outr = posterior_mean_2d(k1r, k2, x1, x2, y, noise, pred_x1=px1, pred_x2=px2, method='cholesky')[0]
     assert torch.allclose(outr, dense_pred(C1r, Cp1r), atol=1e-6)
     # one axis only (pred_x2=None) -> (Nb, Npred1, N2)
-    assert posterior_mean_2d(k1c, k2, x1, x2, y, noise, pred_x1=px1, method='cholesky').shape == (Nb, 4, N2)
+    assert posterior_mean_2d(k1c, k2, x1, x2, y, noise, pred_x1=px1, method='cholesky')[0].shape == (Nb, 4, N2)
     # pred + C1_rcond shrinkage is not supported
     with pytest.raises(NotImplementedError):
         posterior_mean_2d(k1c, k2, x1, x2, y, noise, pred_x1=px1, C1_rcond=1e-2)
@@ -458,11 +458,11 @@ def test_posterior_mean_pred_kernel():
 	Cs = ks(x[:, None]).to_dense().detach()
 	Cp = kp(x[:, None]).to_dense().detach()
 	ref = torch.stack([Cp @ torch.linalg.solve(Cs + torch.diag(noise[b]), y[b]) for b in range(4)])
-	assert torch.allclose(posterior_mean_1d(ks, x, y, noise),
-	                      posterior_mean_1d(ks, x, y, noise, pred_kernel=ks))   # None reuses Cs
-	out = posterior_mean_1d(ks, x, y, noise, pred_kernel=kp)
+	assert torch.allclose(posterior_mean_1d(ks, x, y, noise)[0],
+	                      posterior_mean_1d(ks, x, y, noise, pred_kernel=ks)[0])   # None reuses Cs
+	out = posterior_mean_1d(ks, x, y, noise, pred_kernel=kp)[0]
 	assert torch.allclose(out, ref, atol=1e-8)
-	assert not torch.allclose(out, posterior_mean_1d(ks, x, y, noise))         # genuinely different
+	assert not torch.allclose(out, posterior_mean_1d(ks, x, y, noise)[0])         # genuinely different
 
 	# ---- 2D (all methods) + inpaint forwarding + C1_rcond coexistence ----
 	N1, N2 = 5, 7
@@ -477,11 +477,11 @@ def test_posterior_mean_pred_kernel():
 	                                              y2[b].reshape(-1))).reshape(N1, N2) for b in range(3)])
 	for method in ('woodbury', 'cg', 'cholesky'):
 		out2 = posterior_mean_2d(k1s, k2s, x1, x2, y2, n2, pred_kernel1=k1p, pred_kernel2=k2p,
-		                         method=method, rcond=1e-14, cg_tol=1e-11, cg_max_iter=4000)
+		                         method=method, rcond=1e-14, cg_tol=1e-11, cg_max_iter=4000)[0]
 		assert torch.allclose(out2, ref2, atol=1e-6), method
-	assert torch.allclose(posterior_mean_2d(k1s, k2s, x1, x2, y2, n2, method='cholesky'),
+	assert torch.allclose(posterior_mean_2d(k1s, k2s, x1, x2, y2, n2, method='cholesky')[0],
 	                      posterior_mean_2d(k1s, k2s, x1, x2, y2, n2, pred_kernel1=k1s,
-	                                        pred_kernel2=k2s, method='cholesky'))   # None reuses Cs
+	                                        pred_kernel2=k2s, method='cholesky')[0])   # None reuses Cs
 	# inpaint forwards pred_kernel (mdl == reference, shape preserved)
 	flags = torch.zeros(3, N1, N2, dtype=torch.bool); flags[:, :, ::3] = True
 	inp, mdl = inpaint_2d(k1s, k2s, x1, x2, y2, n2, flags, pred_kernel1=k1p, pred_kernel2=k2p,
@@ -490,7 +490,7 @@ def test_posterior_mean_pred_kernel():
 	assert torch.allclose(inp, torch.where(flags, mdl, y2))
 	# pred_kernel coexists with C1_rcond (which shrinks only the signal block) -- runs, right shape
 	mt = posterior_mean_2d(k1s, k2s, x1, x2, y2, n2, pred_kernel1=k1p, pred_kernel2=k2p,
-	                       C1_rcond=1e-6, method='cg', cg_tol=1e-8)
+	                       C1_rcond=1e-6, method='cg', cg_tol=1e-8)[0]
 	assert mt.shape == y2.shape
 
 
@@ -513,13 +513,13 @@ def test_precond_blockdiag_matches_eigen():
 
     kw = dict(method='cg', cg_tol=1e-5, cg_max_iter=8000)
     for name, noise in [('separable', sep), ('scatter', scat), ('mixed', mixed)]:
-        m_eig = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='eigen', **kw)
-        m_bd = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='blockdiag', **kw)
+        m_eig = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='eigen', **kw)[0]
+        m_bd = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='blockdiag', **kw)[0]
         assert torch.allclose(m_bd, m_eig, atol=1e-4), (name, (m_bd - m_eig).abs().max())
 
     # no fully-flagged channel -> blockdiag reverts to eigen exactly (bit-for-bit)
-    m_eig = posterior_mean_2d(k1, k2, x1, x2, y, scat, precond='eigen', **kw)
-    m_bd = posterior_mean_2d(k1, k2, x1, x2, y, scat, precond='blockdiag', **kw)
+    m_eig = posterior_mean_2d(k1, k2, x1, x2, y, scat, precond='eigen', **kw)[0]
+    m_bd = posterior_mean_2d(k1, k2, x1, x2, y, scat, precond='blockdiag', **kw)[0]
     assert (m_bd - m_eig).abs().max().item() == 0.0
     with pytest.raises(ValueError):
         posterior_mean_2d(k1, k2, x1, x2, y, sep, precond='nope', **kw)
@@ -540,20 +540,20 @@ def test_posterior_mean_broadcasts_noise():
     # 1D (freq): shared (1, Nt, Nf) and lower-rank (Nf,) both broadcast over (Nbls, Nt)
     nz1 = 0.05 + torch.rand(1, Nt, Nf, dtype=torch.float64)
     for method in ('cholesky', 'woodbury'):
-        out = posterior_mean_1d(kf, nu, y, nz1, method=method)
-        ref = posterior_mean_1d(kf, nu, y, nz1.expand(Nbls, -1, -1).contiguous(), method=method)
+        out = posterior_mean_1d(kf, nu, y, nz1, method=method)[0]
+        ref = posterior_mean_1d(kf, nu, y, nz1.expand(Nbls, -1, -1).contiguous(), method=method)[0]
         assert torch.allclose(out, ref, atol=1e-9), method
     nzrow = 0.05 + torch.rand(Nf, dtype=torch.float64)
-    assert torch.allclose(posterior_mean_1d(kf, nu, y, nzrow),
-                          posterior_mean_1d(kf, nu, y, nzrow.expand(Nbls, Nt, Nf).contiguous()),
+    assert torch.allclose(posterior_mean_1d(kf, nu, y, nzrow)[0],
+                          posterior_mean_1d(kf, nu, y, nzrow.expand(Nbls, Nt, Nf).contiguous())[0],
                           atol=1e-9)
 
     # 2D (joint): shared (1, Nt, Nf) broadcasts over the baseline axis, all methods
     nz2 = 0.05 + torch.rand(1, Nt, Nf, dtype=torch.float64)
     for method in ('cholesky', 'woodbury', 'cg'):
-        out = posterior_mean_2d(kt, kf, t, nu, y, nz2, method=method, cg_tol=1e-11, cg_max_iter=3000)
+        out = posterior_mean_2d(kt, kf, t, nu, y, nz2, method=method, cg_tol=1e-11, cg_max_iter=3000)[0]
         ref = posterior_mean_2d(kt, kf, t, nu, y, nz2.expand(Nbls, -1, -1).contiguous(),
-                                method=method, cg_tol=1e-11, cg_max_iter=3000)
+                                method=method, cg_tol=1e-11, cg_max_iter=3000)[0]
         assert torch.allclose(out, ref, atol=1e-7), method
 
 
@@ -576,7 +576,7 @@ def test_cg_tol_flag_invariant():
     base = 0.01 * torch.ones(1, Nt, Nf, dtype=torch.float64)
     for flag_var in (1e6, 1e12):
         nz = base.clone(); nz[flags] = flag_var
-        out = posterior_mean_2d(kt, kf, t, nu, y, nz, method='cg', cg_tol=1e-6, cg_max_iter=4000)
+        out = posterior_mean_2d(kt, kf, t, nu, y, nz, method='cg', cg_tol=1e-6, cg_max_iter=4000)[0]
         A = Ks + torch.diag(nz.reshape(-1).to(torch.cdouble))
         ref = (Ks @ torch.linalg.solve(A, y.reshape(-1))).reshape(Nt, Nf)
         assert (out[0] - ref).abs().max() < 1e-6, flag_var
@@ -595,7 +595,7 @@ def test_inpaint_1d_2d():
     flags = torch.zeros(B, Nx, dtype=bool); flags[:, 4] = True; flags[0, 1] = True
     noise = 0.01 * torch.ones(B, Nx, dtype=torch.float64); noise[flags] = 1e12
     inp, mdl = inpaint_1d(kr, x, y, noise, flags)
-    ref = posterior_mean_1d(kr, x, y, noise)
+    ref = posterior_mean_1d(kr, x, y, noise)[0]
     assert inp.dtype == torch.cdouble
     assert torch.allclose(mdl, ref)                         # mdl is the full posterior mean
     assert torch.equal(inp[~flags], y[~flags])              # good untouched
@@ -613,7 +613,7 @@ def test_inpaint_1d_2d():
     nz2 = 0.01 * torch.ones(Nb, N1, N2, dtype=torch.float64); nz2[fl2] = 1e12
     kw = dict(method='cg', cg_tol=1e-11, cg_max_iter=3000)
     inp2, mdl2 = inpaint_2d(k1, k2, x1, x2, y2, nz2, fl2, **kw)
-    ref2 = posterior_mean_2d(k1, k2, x1, x2, y2, nz2, **kw)
+    ref2 = posterior_mean_2d(k1, k2, x1, x2, y2, nz2, **kw)[0]
     assert torch.allclose(mdl2, ref2)
     assert torch.equal(inp2[~fl2], y2[~fl2])
     assert torch.allclose(inp2[fl2], mdl2[fl2])
@@ -697,7 +697,7 @@ def test_posterior_draws_1d_moments():
     assert f.shape == (S, Nx) and f.is_complex()
     emp_m = f.mean(0)
     assert (emp_m - m).abs().max() < 0.02
-    assert (emp_m - posterior_mean_1d(kc, x, y, noise)[0]).abs().max() < 0.02
+    assert (emp_m - posterior_mean_1d(kc, x, y, noise)[0][0]).abs().max() < 0.02
     fc = f - emp_m
     assert (cov(fc, fc) - Cpost).abs().max() / Cpost.abs().max() < 0.05
 
@@ -761,13 +761,13 @@ def test_posterior_draws_2d_mean():
 
     f = posterior_draws_2d(k1, k2, x1, x2, y, noise, size=S, method='cholesky', generator=g)
     assert f.shape == (S, 1, N1, N2) and f.is_complex()
-    m = posterior_mean_2d(k1, k2, x1, x2, y, noise, method='cholesky')[0]
+    m = posterior_mean_2d(k1, k2, x1, x2, y, noise, method='cholesky')[0][0]
     assert (f.mean(0)[0] - m).abs().max() < 0.02
 
     # with a 2D mean function: empirical mean reproduces posterior_mean_2d(mu=...)
     muf = lambda a, b: torch.full((a.shape[0], b.shape[0]), 0.5 + 0.3j, dtype=torch.cdouble)
     fmu = posterior_draws_2d(k1, k2, x1, x2, y, noise, mu=muf, size=S, method='cholesky', generator=g)
-    mmu = posterior_mean_2d(k1, k2, x1, x2, y, noise, mu=muf, method='cholesky')[0]
+    mmu = posterior_mean_2d(k1, k2, x1, x2, y, noise, mu=muf, method='cholesky')[0][0]
     assert (fmu.mean(0)[0] - mmu).abs().max() < 0.02
 
 
