@@ -1017,6 +1017,11 @@ class BandLimitKernel(Kernel):
     grid on each call, so evaluate it at prediction time (once), not inside a fit. Assumes a
     regular 1D input grid (the DPSS concentration).
 
+    For large ``tau_c`` the Sinc eigenvalues cluster tightly at 1 (Slepian's ill-conditioning),
+    and against a high-dynamic-range signal the hard ``tol`` cut can leave edge artifacts at the
+    band boundary. The optional ``taper`` softens the delay edge -- a cheap ``GaussSinc``-equivalent
+    that curves the otherwise-flat covariance to regularize the eigendecomposition.
+
     Parameters
     ----------
     base_kernel : gpytorch.kernels.Kernel
@@ -1033,17 +1038,27 @@ class BandLimitKernel(Kernel):
     reject : bool, optional
         If True, project onto the complement ``|tau| > tau_c`` (``I - B``, a notch) instead of the
         band. Default False.
+    taper : float, optional
+        Gaussian softening of the delay-band edge, as a fraction of ``tau_c`` (roll-off width
+        ``sigma_tau = taper * tau_c``): multiplies the Sinc concentration kernel by
+        ``exp(-2 pi^2 (taper tau_c)^2 (x_i - x_j)^2)``. This is the lag-domain form of a
+        Gaussian-softened band (a cheap ``GaussSinc`` with no arbitrary-precision math) -- a
+        "jitter" that curves the flat Sinc to stabilize its ``eigh`` and reduce band-edge ringing
+        at large ``tau_c``. 0 = the hard Sinc (default); start around 0.01-0.05 and raise until the
+        edge artifact clears (larger = softer, slightly wider band).
     """
 
     is_stationary = False   # a band projection is not stationary
 
-    def __init__(self, base_kernel, tau_c, tol=0.99, num_modes=None, reject=False, **kwargs):
+    def __init__(self, base_kernel, tau_c, tol=0.99, num_modes=None, reject=False, taper=0.0,
+                 **kwargs):
         super().__init__(**kwargs)
         self.base_kernel = base_kernel
         self.tau_c = float(tau_c)
         self.tol = float(tol)
         self.num_modes = None if num_modes is None else int(num_modes)
         self.reject = bool(reject)
+        self.taper = float(taper)
 
     def _projector(self, x):
         # DPSS projector onto |tau| < tau_c: eigenvectors of the Sinc concentration kernel whose
@@ -1051,6 +1066,8 @@ class BandLimitKernel(Kernel):
         nu = x[..., 0]                                  # 1D grid coordinate, (..., n)
         lag = nu.unsqueeze(-1) - nu.unsqueeze(-2)       # (..., n, n)
         S = torch.sinc(2.0 * self.tau_c * lag)          # = SincKernel(lengthscale = 1/(2 tau_c))
+        if self.taper:                                  # Gaussian-soften the delay edge (cheap
+            S = S * torch.exp(-2.0 * math.pi**2 * (self.taper * self.tau_c)**2 * lag**2)  # GaussSinc)
         w, V = torch.linalg.eigh(S)                     # ascending; eigenvalues in [0, 1]
         if self.num_modes is not None:
             Vb = V[..., :, S.shape[-1] - self.num_modes:]

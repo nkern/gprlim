@@ -32,7 +32,8 @@ def mean_center(y, noise, dim=-1):
 
 
 def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend=False,
-                      rcond=1e-15, method='cholesky', chunk=None, pred_kernel=None):
+                      rcond=1e-15, method='cholesky', chunk=None, pred_kernel=None,
+                      cg_tol=1e-6, cg_max_iter=1000):
     """
     GP posterior mean (Wiener filter) ``Cp (Cs + diag(noise))^-1 (y - mu) + mu`` along one
     axis of ``y``, batched over all the others.
@@ -67,22 +68,25 @@ def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend
     detrend : bool, optional
         If True, do another global mean-subtraction after subtracting mu from data.
     rcond, method, chunk
-        Forwarded to the batched solver (see :func:`gprlim.solvers.gpr_invert`).
+        Forwarded to the batched solver (see :func:`gprlim.solvers.gpr_invert`). ``method='cg'``
+        is a preconditioned-CG solve (:func:`gprlim.solvers.cg_batched`) that is cheapest when the
+        covariance is high-rank (e.g. a ``DeltaKernel``) and the flags are near-shared across the
+        batch (fully-flagged / vertical channels, as in the ``2d_1d`` final frequency stage); it
+        matches 'woodbury' to ``cg_tol`` and reports ``cg_iters``.
+    cg_tol, cg_max_iter : float, int
+        CG tolerance / iteration cap for ``method='cg'`` (see :func:`gprlim.solvers.cg_batched`).
 
     Returns
     -------
     tensor
         Posterior mean: ``y`` with its ``dim`` axis replaced by length Npred.
     info : dict
-        Solver diagnostics; empty for the 1D path (present for API parity with
-        :func:`posterior_mean_2d`, whose ``method='cg'`` reports ``cg_iters``).
+        Solver diagnostics; empty except for ``method='cg'``, which reports ``cg_iters`` /
+        ``resid`` (as :func:`posterior_mean_2d` does).
     """
     if dim == 0:
         raise ValueError("dim must not be 0 (the batch axis); use a non-zero / negative dim.")
-    if method == 'cg':
-        raise NotImplementedError("'cg' is implemented only for the 2D path "
-                                  "(posterior_mean_2d); the 1D dense covariance is small -- "
-                                  "use 'cholesky' or 'woodbury'.")
+    info = {}
     x = torch.as_tensor(x).reshape(-1)
     Nx = x.shape[-1]
     # move the sample axis to last and flatten the remaining axes into one batch; noise is
@@ -114,13 +118,15 @@ def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend
         # otherwise solve directly (promoting a real cov to complex for complex data).
         if yc.is_complex() and not Cs.is_complex():
             yc, nf = stack_ri(yc), torch.cat([nf, nf], 0)
-            pred = unstack_ri(gpr_invert(Cs, nf, B=Cp, y=yc, rcond=rcond, method=method, chunk=chunk))
+            pred = unstack_ri(gpr_invert(Cs, nf, B=Cp, y=yc, rcond=rcond, method=method, chunk=chunk,
+                                         cg_tol=cg_tol, cg_max_iter=cg_max_iter, info=info))
         else:
             Cs, Cp = promote_like(Cs, yc), promote_like(Cp, yc)
-            pred = gpr_invert(Cs, nf, B=Cp, y=yc, rcond=rcond, method=method, chunk=chunk)
+            pred = gpr_invert(Cs, nf, B=Cp, y=yc, rcond=rcond, method=method, chunk=chunk,
+                              cg_tol=cg_tol, cg_max_iter=cg_max_iter, info=info)
         pred = pred + mu_pred + trend
 
-    return pred.reshape(*lead, pred.shape[-1]).movedim(-1, dim), {}
+    return pred.reshape(*lead, pred.shape[-1]).movedim(-1, dim), info
 
 
 def posterior_mean_2d(kernel1, kernel2, x1, x2, y, noise, pred_x1=None, pred_x2=None,

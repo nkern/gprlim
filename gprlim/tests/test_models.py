@@ -333,10 +333,37 @@ def test_posterior_mean_1d():
         ref_d[i] = Kc2 @ torch.linalg.solve(Kc2 + torch.diag(noise[i].to(torch.cdouble)), y[i] - t) + t
     assert torch.allclose(out_d, ref_d, atol=1e-9)
 
-    # 'cg' is 2D-only; the 1D dense covariance is small -> NotImplementedError
-    import pytest
-    with pytest.raises(NotImplementedError):
-        posterior_mean_1d(kr, x, y, noise, method='cg')
+    # 'cg' (shared-preconditioner batched PCG) matches the direct solve and reports its iters
+    out_cg, info_cg = posterior_mean_1d(kc, x, y, noise, method='cg')
+    assert torch.allclose(out_cg, dense_ref(Kc, Kc, y, noise), atol=1e-6)
+    assert info_cg.get('cg_iters', 0) >= 1
+
+
+def test_posterior_mean_1d_cg():
+    """method='cg' (shared-preconditioner batched PCG) matches 'woodbury' for a high-rank
+    (DeltaKernel) frequency covariance with vertical flags + heterogeneous noise (the 2d_1d
+    final-frequency regime), across a complex kernel and the real-kernel / complex-data (stacked)
+    path, and reports cg_iters. NOTE: kept as an option pending performance evaluation -- for
+    heterogeneous noise + scatter it can be slower than 'woodbury' (see the solver notes)."""
+    torch.manual_seed(0)
+    Nbls, Nf = 8, 64
+    nu = torch.linspace(120, 180, Nf, dtype=torch.float64)
+    base = kernels.CarrierKernel(kernels.ScaleKernel(kernels.SincKernel()).double(), tau=0.05).double()
+    base.base_kernel.base_kernel.lengthscale = 3.0
+    delta = kernels.DeltaKernel(base, amp=0.1 ** 2, tau=0.3, symmetric=True).double()
+    rbf = kernels.ScaleKernel(kernels.RBFKernel()).double(); rbf.base_kernel.lengthscale = 3.0
+
+    y = torch.randn(Nbls, Nf, dtype=torch.cdouble)
+    chan_flag = torch.zeros(Nf, dtype=bool); chan_flag[::7] = True          # vertical stripes
+    noise = 0.1 + 0.05 * torch.rand(Nbls, Nf, dtype=torch.float64)          # heterogeneous good noise
+    noise[:, chan_flag] = 1e10
+    noise[torch.rand(Nbls, Nf) < 0.02] = 1e10                              # light scatter
+
+    for kern in (delta, rbf):                                              # complex + stacked-real paths
+        mw = posterior_mean_1d(kern, nu, y, noise, method='woodbury')[0]
+        mc, info = posterior_mean_1d(kern, nu, y, noise, method='cg')
+        assert torch.allclose(mc, mw, atol=1e-5)
+        assert info['cg_iters'] >= 1
 
 
 def test_posterior_mean_2d():

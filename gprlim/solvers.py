@@ -1000,7 +1000,81 @@ def cholesky_batched(C, N, B=None, y=None, rcond=1e-15):
     return inv if B is None else torch.einsum('rp,bpq->brq', B, inv)
 
 
-def gpr_invert(C, N, B=None, y=None, rcond=1e-15, method='cholesky', chunk=None):
+def cg_batched(C, N, B=None, y=None, rcond=1e-15, cg_tol=1e-6, cg_max_iter=1000, info=None):
+    """
+    Batched preconditioned-CG solve of ``(C + diag(N_b))^-1 y_b`` over a batch of noise diagonals
+    ``N`` sharing a low-rank covariance ``C``, via the shared :func:`pcg` primitive (same
+    inverse-variance-weighted stop test as the 2D :func:`kron_wiener_cg`, so ``cg_tol`` is a
+    data-independent accuracy).
+
+    The operator applies ``C`` in low-rank form ``U U^H`` (modes above ``rcond``, so it solves the
+    same rank-reduced system as :func:`woodbury_batched` and agrees with it to ``cg_tol``). The
+    preconditioner is the Woodbury inverse of ``U U^H + diag(Dshared)`` built ONCE from
+    ``Dshared = min_b N_b`` -- the per-channel noise that is large only on channels flagged across
+    the *whole* batch (the same quantity the 2D 'blockdiag' preconditioner uses). When the flags are
+    (near-)vertical -- fully-flagged channels common to every spectrum, e.g. the ``2d_1d`` final
+    frequency solve -- this shared factor captures the bulk of every ``A_b`` and CG only cleans up
+    the per-spectrum scatter, so the iteration count scales with the *scatter*, not ``rank(C)``. That
+    makes it much cheaper than :func:`woodbury_batched` (whose ``O(n k^2)`` capacitance is paid per
+    spectrum) for high-rank kernels such as a ``DeltaKernel``; for a shared flag pattern it converges
+    in a single iteration.
+
+    Same input / output contract as :func:`woodbury_batched`, but ``y``-only (no full-inverse path)
+    and requires ``N > 0``. If ``info`` is given it is updated with ``cg_iters`` / ``resid``.
+
+    Parameters
+    ----------
+    C : tensor
+        Shared signal covariance (n, n), PSD.
+    N : tensor
+        Per-batch noise variance diagonal (Nbatch, n), > 0.
+    B : tensor, optional
+        Left matrix (N*, n), e.g. cross-covariance K(x*, X).
+    y : tensor
+        Observations (Nbatch, n).
+    rcond : float
+        Relative eigenvalue cutoff for the low-rank factor of C.
+    cg_tol, cg_max_iter : float, int
+        CG relative-residual tolerance and iteration cap (forwarded to :func:`pcg`).
+    info : dict, optional
+        If given, updated in place with the CG ``cg_iters`` and ``resid``.
+
+    Returns
+    -------
+    tensor
+    """
+    assert y is not None, "cg_batched solves against y (no full-inverse path); use woodbury/cholesky"
+
+    # low-rank factor of the shared signal covariance: C ~= U U^H (the same truncation woodbury
+    # uses, so the two solve the identical rank-reduced system and agree to CG tolerance)
+    U = _lowrank_factor(C, rcond)                                  # (n, k)
+
+    # operator A_b v = C v + N_b v = U (U^H v) + N_b v, batched over the leading axis of v
+    def matvec(v):
+        return torch.einsum('nk,...k->...n', U, torch.einsum('nk,...n->...k', U.conj(), v)) + N * v
+
+    # shared preconditioner M^-1 = (U U^H + diag(Dshared))^-1 via Woodbury, from the per-channel
+    # noise Dshared = min over the batch -- large only on fully-flagged (vertical) channels, so M is
+    # exact where the flags are common and CG only corrects the per-spectrum scatter.
+    Dinv = N.amin(dim=0).reciprocal().to(U.dtype)                 # (n,)
+    cap = torch.einsum('nk,n,nl->kl', U.conj(), Dinv, U)          # I_k + U^H diag(Dinv) U
+    cap.diagonal().add_(1.0)
+    Lc = torch.linalg.cholesky(cap)
+
+    def apply_M(r):
+        Dr = Dinv * r
+        z = torch.cholesky_solve(torch.einsum('nk,...n->...k', U.conj(), Dr).unsqueeze(-1),
+                                 Lc).squeeze(-1)
+        return Dr - Dinv * torch.einsum('nk,...k->...n', U, z)
+
+    alpha, inf = pcg(matvec, y, M=apply_M, tol=cg_tol, max_iter=cg_max_iter, weight=N.reciprocal())
+    if info is not None:
+        info['cg_iters'], info['resid'] = inf['iters'], inf['resid']
+    return alpha if B is None else torch.einsum('mn,...n->...m', B, alpha)
+
+
+def gpr_invert(C, N, B=None, y=None, rcond=1e-15, method='cholesky', chunk=None,
+               cg_tol=1e-6, cg_max_iter=1000, info=None):
     """
     Perform (C + N)^-1 where C is low-rank
     and N is diagonal using Woodbury identity.
@@ -1021,10 +1095,17 @@ def gpr_invert(C, N, B=None, y=None, rcond=1e-15, method='cholesky', chunk=None)
         Relative condition / eigenvalue cutoff.
     method : str
         Batched solver for the shared-C, batched-N case: 'cholesky'
-        (default, robust, no low-rank assumption) or 'woodbury'
-        (faster when rank(C) < Nsamples; requires N > 0).
+        (default, robust, no low-rank assumption), 'woodbury' (faster
+        when rank(C) < Nsamples; requires N > 0), or 'cg' (preconditioned
+        CG, :func:`cg_batched` -- cheapest when C is high-rank and the
+        flags are near-shared across the batch, e.g. fully-flagged
+        channels; requires N > 0, ignores ``chunk``).
     chunk : int, optional
         Process the batch in chunks of this size to bound memory.
+    cg_tol, cg_max_iter : float, int
+        CG tolerance / iteration cap for ``method='cg'`` (see :func:`cg_batched`).
+    info : dict, optional
+        For ``method='cg'``, updated in place with ``cg_iters`` / ``resid``.
 
     Returns
     -------
@@ -1049,8 +1130,13 @@ def gpr_invert(C, N, B=None, y=None, rcond=1e-15, method='cholesky', chunk=None)
                 for i in range(len(N))
             ])
 
+        elif method == 'cg':
+            # C shared, N batched, high-rank C / near-shared flags: preconditioned CG
+            out = cg_batched(C, N, B=B, y=y, rcond=rcond,
+                             cg_tol=cg_tol, cg_max_iter=cg_max_iter, info=info)
+
         else:
-            # C shared, N batched: vectorized solve (the main driver)
+            # C shared, N batched: vectorized direct solve (the main driver)
             solver = {'woodbury': woodbury_batched, 'cholesky': cholesky_batched}[method]
             if chunk is None:
                 out = solver(C, N, B=B, y=y, rcond=rcond)

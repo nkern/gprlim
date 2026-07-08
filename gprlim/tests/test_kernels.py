@@ -284,3 +284,18 @@ def test_band_limit_kernel():
     # num_modes bounds the projector (hence the covariance) rank
     kn = kernels.BandLimitKernel(base, tau_c=tau_c, num_modes=6).double()(nu[:, None]).to_dense().detach()
     assert torch.linalg.matrix_rank(kn).item() <= 6
+
+    # taper (cheap GaussSinc-equivalent) softens the band edge to stabilize the DPSS eigh: still
+    # Hermitian PSD and band-isolating, and it widens the razor-sharp Slepian eigenvalue transition
+    kt = kernels.BandLimitKernel(base, tau_c=tau_c, tol=0.999, taper=0.1).double()
+    Kt = kt(nu[:, None]).to_dense().detach().to(torch.cdouble)
+    assert torch.allclose(Kt, Kt.conj().T, atol=1e-9)
+    assert torch.linalg.eigvalsh(Kt).min() > -1e-8
+    assert oob(Kt) < 0.1                                                   # still isolates the band
+    lag = nu[:, None] - nu[None, :]
+    def n_transition(S):                                                  # eigenvalues strictly in (0,1)
+        w = torch.linalg.eigvalsh(S)
+        return int(((w > 0.01) & (w < 0.99)).sum())
+    S_hard = torch.sinc(2 * tau_c * lag)
+    S_soft = S_hard * torch.exp(-2 * np.pi ** 2 * (0.1 * tau_c) ** 2 * lag ** 2)
+    assert n_transition(S_soft) > n_transition(S_hard)                     # softer edge = wider transition
