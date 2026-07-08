@@ -5,7 +5,9 @@ import numpy as np
 
 import torch
 from linear_operator import to_linear_operator
-from linear_operator.operators import LinearOperator, KroneckerProductLinearOperator
+from linear_operator.operators import (
+    LinearOperator, KroneckerProductLinearOperator, ZeroLinearOperator
+)
 from torch import Tensor
 
 from gpytorch.constraints import Interval, Positive
@@ -731,6 +733,345 @@ class CarrierKernel(Kernel):
         return Kr * torch.exp(2j * math.pi * tau * lag)
 
 
+class ReflectionKernel(Kernel):
+    r"""
+    Multiply a base covariance by a frequency-dependent reflection gain, modeling a
+    multiplicative reflection systematic ``d = g \odot s`` (e.g.\ an antenna/cable reflection
+    in a visibility spectrum). If the base field ``s`` has covariance ``K_base`` and the
+    reflection gain is ``g(x) = 1 + A e^{+2\pi i\,\tau x}``, the reflected data ``d = g\,s`` has
+    covariance
+
+    .. math::
+        K(x_1, x_2) = g(x_1)\, K_\mathrm{base}(x_1, x_2)\, \overline{g(x_2)},
+
+    i.e.\ ``K = G K_base G^H`` with ``G = diag(g)`` -- a diagonal congruence. So ``K`` is
+    Hermitian PSD whenever the base kernel is, and it preserves the base kernel's rank (a
+    low-rank factor ``U`` just becomes ``G U``) and its Kronecker separability (the gain acts
+    on one axis only), so the structured solvers carry through unchanged. Unlike an additive
+    carrier term, it keeps the direct-times-reflected coherence: expanding
+    ``g(x_1)\overline{g(x_2)}`` gives the base kernel, a stationary ``|A|^2`` carrier at
+    ``tau``, and two non-stationary cross terms.
+
+    Writing the (complex) reflection coefficient as ``A = amp\, e^{i\phi}``: with
+    ``symmetric=True`` (default) the gain is the real, ``+/- tau`` symmetric
+    ``g(x) = 1 + 2\,\mathrm{amp}\cos(2\pi\tau x + \phi)`` (reflection power at both delay signs;
+    the kernel stays real if the base is real). With ``symmetric=False`` it is the complex,
+    one-sided ``g(x) = 1 + \mathrm{amp}\, e^{i(2\pi\tau x + \phi)}``, matching the multiplicative
+    reflection literally, and the kernel is complex Hermitian (use the complex-capable solvers).
+    ``amp = 0`` recovers the base kernel.
+
+    Parameters
+    ----------
+    base_kernel : gpytorch.kernels.Kernel
+        Base covariance to reflect, e.g.\ a frequency (delay) kernel.
+    amp : float, optional
+        Reflection amplitude magnitude ``|A| = amp`` (dimensionless, relative to the unit direct
+        term). Default 0 (-> the base kernel unchanged). Constrain it positive
+        (``amp_constraint``) for fitting.
+    tau : float, optional
+        Reflection delay, real; units conjugate to the input (e.g.\ us for frequency in MHz).
+        Default 0.
+    phase : float, optional
+        Reflection phase ``phi`` [radians]: ``A = amp\, e^{i\,phi}``. Default 0.
+    symmetric : bool, optional
+        If True (default), the real ``+/- tau`` gain ``1 + 2\,\mathrm{amp}\cos(2\pi\tau x + \phi)``;
+        if False, the complex one-sided gain ``1 + \mathrm{amp}\, e^{i(2\pi\tau x + \phi)}``.
+    amp_constraint, tau_constraint, phase_constraint : gpytorch.constraints.Interval, optional
+        Optional constraints (default unconstrained). A positive / ``Interval`` constraint on
+        ``amp`` is recommended for stable fitting.
+    amp_prior, tau_prior, phase_prior : gpytorch.priors.Prior, optional
+        Optional priors on ``amp`` / ``tau`` / ``phase``.
+    """
+
+    is_stationary = False   # the reflection gain depends on absolute frequency, not just the lag
+
+    def __init__(self, base_kernel, amp=0.0, tau=0.0, phase=0.0, symmetric=True,
+                 amp_constraint=None, tau_constraint=None, phase_constraint=None,
+                 amp_prior=None, tau_prior=None, phase_prior=None, **kwargs):
+        super().__init__(**kwargs)
+        self.base_kernel = base_kernel
+        self.symmetric = symmetric
+        self.register_parameter('raw_amp',
+                                torch.nn.Parameter(torch.zeros(*self.batch_shape, 1)))
+        if amp_constraint is not None:
+            self.register_constraint('raw_amp', amp_constraint)
+        self.amp = amp
+        if amp_prior is not None:
+            self.register_prior('amp_prior', amp_prior,
+                                lambda m: m.amp, lambda m, v: m._set_amp(v))
+        self.register_parameter('raw_tau',
+                                torch.nn.Parameter(torch.zeros(*self.batch_shape, 1)))
+        if tau_constraint is not None:
+            self.register_constraint('raw_tau', tau_constraint)
+        self.tau = tau
+        if tau_prior is not None:
+            self.register_prior('tau_prior', tau_prior,
+                                lambda m: m.tau, lambda m, v: m._set_tau(v))
+        self.register_parameter('raw_phase',
+                                torch.nn.Parameter(torch.zeros(*self.batch_shape, 1)))
+        if phase_constraint is not None:
+            self.register_constraint('raw_phase', phase_constraint)
+        self.phase = phase
+        if phase_prior is not None:
+            self.register_prior('phase_prior', phase_prior,
+                                lambda m: m.phase, lambda m, v: m._set_phase(v))
+
+    @property
+    def amp(self):
+        c = getattr(self, 'raw_amp_constraint', None)
+        return c.transform(self.raw_amp) if c is not None else self.raw_amp
+
+    @amp.setter
+    def amp(self, value):
+        self._set_amp(value)
+
+    def _set_amp(self, value):
+        value = torch.as_tensor(value).to(self.raw_amp).reshape(self.raw_amp.shape)
+        c = getattr(self, 'raw_amp_constraint', None)
+        self.initialize(raw_amp=c.inverse_transform(value) if c is not None else value)
+
+    @property
+    def tau(self):
+        c = getattr(self, 'raw_tau_constraint', None)
+        return c.transform(self.raw_tau) if c is not None else self.raw_tau
+
+    @tau.setter
+    def tau(self, value):
+        self._set_tau(value)
+
+    def _set_tau(self, value):
+        value = torch.as_tensor(value).to(self.raw_tau).reshape(self.raw_tau.shape)
+        c = getattr(self, 'raw_tau_constraint', None)
+        self.initialize(raw_tau=c.inverse_transform(value) if c is not None else value)
+
+    @property
+    def phase(self):
+        c = getattr(self, 'raw_phase_constraint', None)
+        return c.transform(self.raw_phase) if c is not None else self.raw_phase
+
+    @phase.setter
+    def phase(self, value):
+        self._set_phase(value)
+
+    def _set_phase(self, value):
+        value = torch.as_tensor(value).to(self.raw_phase).reshape(self.raw_phase.shape)
+        c = getattr(self, 'raw_phase_constraint', None)
+        self.initialize(raw_phase=c.inverse_transform(value) if c is not None else value)
+
+    def _gain(self, x):
+        # reflection transfer function g(x) on a frequency coordinate x, shape (..., n);
+        # the (complex) reflection coefficient is A = amp * exp(i * phase)
+        arg = 2 * math.pi * self.tau * x + self.phase
+        if self.symmetric:
+            return 1.0 + 2.0 * self.amp * torch.cos(arg)       # real, +/- tau
+        return 1.0 + self.amp * torch.exp(1j * arg)            # complex, one-sided +tau
+
+    def forward(self, x1, x2, diag=False, **params):
+        # gain congruence  K = g(x1) K_base(x1, x2) conj(g(x2))  =  G K_base G^H
+        Kb = self.base_kernel(x1, x2, diag=diag, **params)
+        Kb = Kb if diag else Kb.to_dense()
+        g1, g2 = self._gain(x1[..., 0]), self._gain(x2[..., 0])
+        if diag:
+            return g1 * Kb * g2.conj()
+        return g1.unsqueeze(-1) * Kb * g2.conj().unsqueeze(-2)
+
+
+class DeltaKernel(Kernel):
+    r"""
+    Boost a base kernel's delay-space support to a delay ``tau`` by modulating it with a carrier --
+    equivalently, convolving the base's delay PSD with a delta at ``tau`` (symmetric ``+/- tau`` by
+    default):
+
+    .. math::
+        K(x_1, x_2) = K_\mathrm{base}(x_1, x_2)\times
+            \begin{cases}
+              1 + 2\,\mathrm{amp}\,\cos(2\pi\tau\,\Delta) & \text{symmetric (real, }\pm\tau)\\
+              1 + \mathrm{amp}\,e^{2\pi i\tau\,\Delta}    & \text{one-sided (complex, }+\tau)
+            \end{cases}
+        \qquad \Delta = x_1 - x_2 .
+
+    This adds a copy of the base kernel's delay power at ``tau`` (and, if symmetric, at ``-tau``),
+    each of relative amplitude ``amp``, on top of the original. It is the stationary, phase-agnostic
+    companion to :class:`ReflectionKernel`: a true multiplicative reflection also carries
+    direct-times-reflected *cross* terms (which ``ReflectionKernel`` supplies via a per-frequency
+    gain ``G K G^H``), whereas this adds only the reflection *power* and lets any phase structure be
+    inferred from the data -- the right choice when the reflection phase is unknown. Because
+    ``1 + 2 amp cos`` and ``1 + amp e^{i.}`` have non-negative PSDs (delta combs) for ``amp >= 0``,
+    the product is Hermitian PSD by the Schur product theorem.
+
+    Use ``symmetric=False`` when the reflection sign (delay) is known: it targets ``+tau`` only and
+    avoids the spurious ``-tau`` power the symmetric form leaves behind (which the GP would
+    otherwise spend a degree of freedom on). Wraps the base kernel and modulates in a single pass,
+    so -- unlike ``base_kernel + ...`` -- the base covariance is evaluated only once.
+
+    Parameters
+    ----------
+    base_kernel : gpytorch.kernels.Kernel
+        Base covariance to boost, e.g.\ a frequency (delay) kernel.
+    amp : float, optional
+        Relative amplitude of the ``tau`` (and ``-tau``, if symmetric) copy. Default 0 (-> the base
+        kernel unchanged). Must be ``>= 0`` for a PSD kernel; constrain it positive when fitting.
+    tau : float, optional
+        Delay of the boost, real; units conjugate to the input (e.g.\ us for frequency in MHz).
+        Default 0.
+    symmetric : bool, optional
+        If True (default) boost ``+/- tau`` symmetrically with a real cosine carrier (a real base
+        stays real); if False boost only ``+tau`` with a complex carrier. Default True.
+    amp_constraint, tau_constraint : gpytorch.constraints.Interval, optional
+        Optional constraints (default unconstrained). A positive constraint on ``amp`` is
+        recommended (and needed for PSD).
+    amp_prior, tau_prior : gpytorch.priors.Prior, optional
+        Optional priors on ``amp`` / ``tau``.
+    """
+
+    is_stationary = True   # a lag-only (stationary) modulation of the base
+
+    def __init__(self, base_kernel, amp=0.0, tau=0.0, symmetric=True,
+                 amp_constraint=None, tau_constraint=None,
+                 amp_prior=None, tau_prior=None, **kwargs):
+        super().__init__(**kwargs)
+        self.base_kernel = base_kernel
+        self.symmetric = bool(symmetric)
+        self.register_parameter('raw_amp',
+                                torch.nn.Parameter(torch.zeros(*self.batch_shape, 1)))
+        if amp_constraint is not None:
+            self.register_constraint('raw_amp', amp_constraint)
+        self.amp = amp
+        if amp_prior is not None:
+            self.register_prior('amp_prior', amp_prior,
+                                lambda m: m.amp, lambda m, v: m._set_amp(v))
+        self.register_parameter('raw_tau',
+                                torch.nn.Parameter(torch.zeros(*self.batch_shape, 1)))
+        if tau_constraint is not None:
+            self.register_constraint('raw_tau', tau_constraint)
+        self.tau = tau
+        if tau_prior is not None:
+            self.register_prior('tau_prior', tau_prior,
+                                lambda m: m.tau, lambda m, v: m._set_tau(v))
+
+    @property
+    def amp(self):
+        c = getattr(self, 'raw_amp_constraint', None)
+        return c.transform(self.raw_amp) if c is not None else self.raw_amp
+
+    @amp.setter
+    def amp(self, value):
+        self._set_amp(value)
+
+    def _set_amp(self, value):
+        value = torch.as_tensor(value).to(self.raw_amp).reshape(self.raw_amp.shape)
+        c = getattr(self, 'raw_amp_constraint', None)
+        self.initialize(raw_amp=c.inverse_transform(value) if c is not None else value)
+
+    @property
+    def tau(self):
+        c = getattr(self, 'raw_tau_constraint', None)
+        return c.transform(self.raw_tau) if c is not None else self.raw_tau
+
+    @tau.setter
+    def tau(self, value):
+        self._set_tau(value)
+
+    def _set_tau(self, value):
+        value = torch.as_tensor(value).to(self.raw_tau).reshape(self.raw_tau.shape)
+        c = getattr(self, 'raw_tau_constraint', None)
+        self.initialize(raw_tau=c.inverse_transform(value) if c is not None else value)
+
+    def forward(self, x1, x2, diag=False, **params):
+        # boost K_base's delay support to tau: K = K_base * (1 + carrier(2 pi tau (x1 - x2)))
+        Kb = self.base_kernel(x1, x2, diag=diag, **params)
+        Kb = Kb if diag else Kb.to_dense()
+        c1, c2 = x1[..., 0], x2[..., 0]
+        if diag:
+            lag, tau, amp = c1 - c2, self.tau, self.amp
+        else:
+            lag = c1.unsqueeze(-1) - c2.unsqueeze(-2)
+            tau, amp = self.tau.unsqueeze(-1), self.amp.unsqueeze(-1)
+        arg = 2 * math.pi * tau * lag
+        if self.symmetric:
+            return Kb * (1.0 + 2.0 * amp * torch.cos(arg))     # real, +/- tau
+        return Kb * (1.0 + amp * torch.exp(1j * arg))          # complex, one-sided +tau
+
+
+class BandLimitKernel(Kernel):
+    r"""
+    Band-limit a base covariance to a delay band ``|tau| < tau_c`` by projecting it onto the
+    band-limited (Slepian / DPSS) subspace: with ``B`` the projector onto ``|tau| < tau_c``,
+
+    .. math::
+        K(x_1, x_2) = B\, K_\mathrm{base}(x_1, x_2)\, B^H .
+
+    ``B = V V^H`` is built from the leading discrete prolate spheroidal sequences -- the
+    eigenvectors of the Sinc concentration kernel ``sinc(2\,tau_c\,(x_i - x_j))`` (equivalently a
+    ``SincKernel`` of lengthscale ``1 / (2\,tau_c)``) whose eigenvalue (in-band energy fraction)
+    exceeds ``tol``. This is the finite-band-optimal ``|tau| < tau_c`` filter: unlike an FFT delay
+    cut it has exponentially small out-of-band leakage, so it isolates the in-band power of any
+    composite kernel without rebuilding it. ``B K_base B^H`` is Hermitian PSD (a congruence) and
+    low rank (rank <= the number of kept modes, ~ the Shannon number ``2\,tau_c\,BW``), so the
+    structured solvers carry through. This is the projection analogue of :class:`ReflectionKernel`
+    (``G K G^H`` with a diagonal gain).
+
+    Intended as a *prediction* kernel (the ``pred_kernel`` of the posterior mean): keep the full
+    composite kernel for the solve, and use this to isolate the ``|tau| < tau_c`` component of the
+    reconstruction (the leftmost ``B`` forces the output into the band). It eigendecomposes the
+    grid on each call, so evaluate it at prediction time (once), not inside a fit. Assumes a
+    regular 1D input grid (the DPSS concentration).
+
+    Parameters
+    ----------
+    base_kernel : gpytorch.kernels.Kernel
+        Base covariance to band-limit, e.g.\ a composite frequency (delay) kernel.
+    tau_c : float
+        Band edge (delay), in units conjugate to the input (e.g.\ us for frequency in MHz).
+    tol : float, optional
+        Keep DPSS modes whose in-band energy fraction (Sinc-kernel eigenvalue) exceeds ``tol``.
+        Default 0.99 -- tight, minimal out-of-band leakage. Lower it (toward 0.5, ~ the Shannon
+        number of modes) for a sharper band edge at the cost of more leakage.
+    num_modes : int, optional
+        If given, keep exactly this many leading modes instead of thresholding by ``tol`` (also
+        the way to use a batched grid, where the ``tol`` mask would be ragged). Default None.
+    reject : bool, optional
+        If True, project onto the complement ``|tau| > tau_c`` (``I - B``, a notch) instead of the
+        band. Default False.
+    """
+
+    is_stationary = False   # a band projection is not stationary
+
+    def __init__(self, base_kernel, tau_c, tol=0.99, num_modes=None, reject=False, **kwargs):
+        super().__init__(**kwargs)
+        self.base_kernel = base_kernel
+        self.tau_c = float(tau_c)
+        self.tol = float(tol)
+        self.num_modes = None if num_modes is None else int(num_modes)
+        self.reject = bool(reject)
+
+    def _projector(self, x):
+        # DPSS projector onto |tau| < tau_c: eigenvectors of the Sinc concentration kernel whose
+        # in-band energy fraction (eigenvalue) exceeds tol
+        nu = x[..., 0]                                  # 1D grid coordinate, (..., n)
+        lag = nu.unsqueeze(-1) - nu.unsqueeze(-2)       # (..., n, n)
+        S = torch.sinc(2.0 * self.tau_c * lag)          # = SincKernel(lengthscale = 1/(2 tau_c))
+        w, V = torch.linalg.eigh(S)                     # ascending; eigenvalues in [0, 1]
+        if self.num_modes is not None:
+            Vb = V[..., :, S.shape[-1] - self.num_modes:]
+        else:
+            Vb = V[..., :, w > self.tol]
+        B = Vb @ Vb.conj().transpose(-1, -2)
+        if self.reject:
+            B = torch.eye(B.shape[-1], dtype=B.dtype, device=B.device) - B
+        return B
+
+    def forward(self, x1, x2, diag=False, **params):
+        if diag:                                        # diag of B K_base B^H needs the full matrix
+            return self.forward(x1, x2, diag=False, **params).diagonal(dim1=-2, dim2=-1)
+        Kb = self.base_kernel(x1, x2, diag=False, **params).to_dense()
+        B1 = self._projector(x1)
+        B2 = B1 if x2 is x1 else self._projector(x2)
+        dt = torch.promote_types(B1.dtype, Kb.dtype)    # real B, complex base -> promote for matmul
+        B1, B2, Kb = B1.to(dt), B2.to(dt), Kb.to(dt)
+        return B1 @ Kb @ B2.conj().transpose(-1, -2)
+
+
 class GaussSincKernel(Kernel):
     r"""
     A Gaussian-convolved Sinc covariance (equivalently a top-hat-truncated-Gaussian
@@ -1262,24 +1603,43 @@ def default_time_kernel(
         sinc.base_kernel.raw_outputscale.requires_grad_(False)
         fz.raw_outputscale.requires_grad_(False)
 
+    # add them all
+    K = NamedAdditiveKernel(
+        {
+        'mainlobe': ml,
+        'fr_zero': fz,
+        'fr_sky': sinc,
+        }
+    )
 
     ## Add them all together with a universal scaling
-    k = ScaleKernel(
-        ml + fz + sinc,
+    K = ScaleKernel(
+        K,
         outputscale_constraint=Interval(1e-5, 1e10),
         outputscale_prior=LogNormalPrior(np.log(ml_scale), 5.0),
     )
-    k.outputscale = ml_scale
+    K.outputscale = ml_scale
 
     if not parameter:
-        k.raw_outputscale.requires_grad_(False)
+        K.raw_outputscale.requires_grad_(False)
 
-    return k
+    return K
 
 
 def default_freq_kernel(
-    bl_vec, ml_scale=1e2, pf_scale=1e-1, wd_scale=1e-3, lk_scale=1e-3, lk_kern='twinrbf',
-    buffer=150.0, min_delay=50.0, only_amp=True, only_global_amp=False, pf_real=True,
+    bl_vec,
+    ml_scale=1e2,
+    pf_scale=1e-1,
+    wd_scale=1e-3,
+    lk_scale=1e-3,
+    lk_kern='twinrbf',
+    buffer=150.0,
+    min_delay=50.0,
+    pf_real=True,
+    rf_scale=None,
+    rf_tau=None,
+    only_amp=True,
+    only_global_amp=False,
     parameter=True):
     r"""
     Default frequency kernel composed of
@@ -1290,8 +1650,9 @@ def default_freq_kernel(
     3. SincKernel for -horizon < delays < horizon
     4. SincKernel for supra-horizon leakage or a wide
        TwinRBFKernel at pitchfork delays.
+    5. An optional set of reflection terms wrapped around 1-4.
 
-    all scaled by a universal ScaleKernel. The output kernel
+    and 6. all wrapped by a universal ScaleKernel. The output kernel
     mixture takes frequency in MHz.
 
     The conjugate variable to frequency [MHz] is delay [us], so a carrier ``tau`` is
@@ -1326,17 +1687,21 @@ def default_freq_kernel(
     min_delay : float, optional
         Floor [ns] on the horizon delay (short baselines), and the fiducial inner
         delay scale setting the delay=0 main-lobe and pitchfork widths. Default 50.
+    pf_real : bool, optional
+        If True (default) model the pitchfork with one real ``TwinRBFKernel``, so the
+        returned kernel is real-valued (use it with the real GP / real-imag-stacked
+        path). If False, use two ``CarrierKernel``s and return a complex-dtype kernel
+        (use the complex solver).
+    rf_scale : float or list, optional
+        Amplitude of reflection term(s)
+    rf_tau : float or list, optional
+        Delay [micro-sec] of reflection term(s)
     only_amp : bool, optional
         If True (default) freeze every shape parameter (all lengthscales and
         carrier taus), leaving only the amplitudes (outputscales) free to fit.
     only_global_amp : bool, optional
         If True, freeze all parameters expect for a single global ScaleKernel parameter.
         Supersedes only_amp.
-    pf_real : bool, optional
-        If True (default) model the pitchfork with one real ``TwinRBFKernel``, so the
-        returned kernel is real-valued (use it with the real GP / real-imag-stacked
-        path). If False, use two ``CarrierKernel``s and return a complex-dtype kernel
-        (use the complex solver).
     parameter : bool, optional
         If True, leave kernel attached to parameter, otherwise remove all parameters.
  
@@ -1436,6 +1801,36 @@ def default_freq_kernel(
         supra_k.base_kernel.tau = horizon
         supra_k.outputscale = lk_scale
 
+    ## Sum the kernels
+    K = NamedAdditiveKernel(
+        {
+        'mainlobe': ml,
+        'pfork': pf,
+        'wedge': wedge,
+        'leakage': supra_k
+        }
+    )
+
+    ## 5. Reflection terms
+    if rf_scale is not None:
+        assert rf_tau is not None
+        rf_scale = torch.as_tensor(rf_scale)
+        rf_tau = torch.as_tensor(rf_tau)
+
+        if rf_scale.numel() > 1:
+            for _amp, _tau, _phs in zip(rf_scale, rf_tau, rf_phs):
+                K = _wrap(
+                    K, _amp, _tau, _phs,
+                    only_amp=only_amp, only_global_amp=only_global_amp,
+                    parameter=parameter
+                )
+
+        else:
+            K = _wrap(
+                K, rf_scale, rf_tau, rf_phs, only_amp=only_amp,
+                only_global_amp=only_global_amp, parameter=parameter
+            )
+
     # deactivate parameters if desired
     if only_amp or only_global_amp or not parameter:
         ml.raw_lengthscale.requires_grad_(False)
@@ -1460,17 +1855,17 @@ def default_freq_kernel(
         supra_k.raw_outputscale.requires_grad_(False)
 
     ## Add them all together with a universal scaling
-    k = ScaleKernel(
-        ml + pf + wedge + supra_k,
+    K = ScaleKernel(
+        K,
         outputscale_constraint=Interval(1e-10, 1e10),
         outputscale_prior=LogNormalPrior(np.log(ml_scale), 5.0),
     )
-    k.outputscale = ml_scale
+    K.outputscale = ml_scale
 
     if not parameter:
-        k.raw_outputscale.requires_grad_(False)
+        K.raw_outputscale.requires_grad_(False)
 
-    return k
+    return K
 
 
 def multi_kernel_mixture(
@@ -1627,4 +2022,22 @@ def multi_kernel_mixture(
     return mean, covar
 
 
+class NamedAdditiveKernel(Kernel):
+    """
+    A named additive kernel version of gpytorch.kernels.AdditiveKernel
+    """
+    def __init__(self, kernel_dict):
+        super().__init__()
+        # Use ModuleDict instead of ModuleList to keep your string keys
+        self.kernels = torch.nn.ModuleDict(kernel_dict)
 
+    def forward(self, x1, x2, diag=False, **params):
+        # Initialize zero matrix based on the operation mode
+        res = ZeroLinearOperator() if not diag else 0
+        
+        # Iterate over the explicitly named kernels
+        for name, kern in self.kernels.items():
+            next_term = kern(x1, x2, diag=diag, **params)
+            res = res + next_term
+
+        return res

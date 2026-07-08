@@ -35,6 +35,8 @@ def hera_inpaint(
     n_threads=16,
     rcond_1d=1e-12,
     flag_Ntimes=50,
+    rf_scale=None,
+    rf_tau=None,
     ):
     """
     All purpose inpainting function for drift-scan, redundant radio visibilities.
@@ -100,6 +102,10 @@ def hera_inpaint(
     flag_Ntimes : int, optional
         Channels with a contiguous flagged-time run of at least this many samples are fully
         flagged before a 1D time inpaint (``'1d_1d'`` / ``'time'``). Default 50.
+    rf_scale : float or list, optional
+        Reflection term amplitude(s)
+    rf_tau : float or list, optional
+        Reflection term delay(s) [micro-sec]
 
     Returns
     -------
@@ -122,6 +128,7 @@ def hera_inpaint(
             inpaint=inpaint, fr_buffer=fr_buffer, fr_scale=fr_scale, fz_scale=fz_scale,
             pf_scale=pf_scale, wd_scale=wd_scale, lk_scale=lk_scale, lk_buffer=lk_buffer,
             kernel_var_mult=kernel_var_mult, norm_freq_alpha=None,
+            rf_scale=rf_scale, rf_tau=rf_tau,
         )
 
     ## now run the inpainting
@@ -176,6 +183,8 @@ def build_kernels(
     norm_freq_alpha=None,
     only_amp=True,
     parameter=False,
+    rf_scale=None,
+    rf_tau=None,
     ):
     """
     Build the time (fringe-rate) and frequency (delay) kernels for drift-scan radio
@@ -232,6 +241,10 @@ def build_kernels(
         free (forwarded to the ``default_*_kernel`` builders).
     parameter : bool, optional
         If True keep the kernels' parameters attached; if False (default) detach them.
+    rf_scale : float or list, optional
+        Reflection term amplitude(s)
+    rf_tau : float or list, optional
+        Reflection term delay(s) [micro-sec]
 
     Returns
     -------
@@ -247,7 +260,7 @@ def build_kernels(
     freq_kernel = kernels.default_freq_kernel(
         bl_vec, ml_scale=1e0, pf_scale=pf_scale, wd_scale=wd_scale, lk_scale=lk_scale, 
         pf_real=True, lk_kern='twinrbf', buffer=lk_buffer, min_delay=50.0,
-        only_amp=only_amp, parameter=parameter,
+        only_amp=only_amp, parameter=parameter, rf_scale=rf_scale, rf_tau=rf_tau,
     )
 
 
