@@ -3,6 +3,7 @@ Implementation of GP inpainting pipeline for radio data sets
 """
 import numpy as np
 import torch
+from copy import deepcopy
 
 from . import models, kernels, solvers, utils
 
@@ -37,6 +38,7 @@ def hera_inpaint(
     flag_Ntimes=50,
     rf_scale=None,
     rf_tau=None,
+    rf_width=None,
     ):
     """
     All purpose inpainting function for drift-scan, redundant radio visibilities.
@@ -106,6 +108,8 @@ def hera_inpaint(
         Reflection term amplitude(s)
     rf_tau : float or list, optional
         Reflection term delay(s) [micro-sec]
+    rf_width : float or list, optional
+        Reflection term delay width(s) [micro-sec]
 
     Returns
     -------
@@ -128,7 +132,7 @@ def hera_inpaint(
             inpaint=inpaint, fr_buffer=fr_buffer, fr_scale=fr_scale, fz_scale=fz_scale,
             pf_scale=pf_scale, wd_scale=wd_scale, lk_scale=lk_scale, lk_buffer=lk_buffer,
             kernel_var_mult=kernel_var_mult, norm_freq_alpha=None,
-            rf_scale=rf_scale, rf_tau=rf_tau,
+            rf_scale=rf_scale, rf_tau=rf_tau, rf_width=rf_width,
         )
 
     ## now run the inpainting
@@ -185,6 +189,7 @@ def build_kernels(
     parameter=False,
     rf_scale=None,
     rf_tau=None,
+    rf_width=None
     ):
     """
     Build the time (fringe-rate) and frequency (delay) kernels for drift-scan radio
@@ -245,6 +250,8 @@ def build_kernels(
         Reflection term amplitude(s)
     rf_tau : float or list, optional
         Reflection term delay(s) [micro-sec]
+    rf_width : float or list, optional
+        Reflection term delay width(s) [micro-sec]
 
     Returns
     -------
@@ -260,9 +267,9 @@ def build_kernels(
     freq_kernel = kernels.default_freq_kernel(
         bl_vec, ml_scale=1e0, pf_scale=pf_scale, wd_scale=wd_scale, lk_scale=lk_scale, 
         pf_real=True, lk_kern='twinrbf', buffer=lk_buffer, min_delay=50.0,
-        only_amp=only_amp, parameter=parameter, rf_scale=rf_scale, rf_tau=rf_tau,
+        only_amp=only_amp, parameter=parameter,
+        rf_scale=rf_scale, rf_tau=rf_tau, rf_width=rf_width,
     )
-
 
     if norm_freq_alpha is not None:
         scale = (freqs / freqs.mean())**norm_freq_alpha
@@ -515,6 +522,82 @@ def inpaint_time_1d_then_freq_1d(
 
     return inp_y, mdl
 
+
+def plot_kernel_match(
+    data, time_kernel, freq_kernel, times, freqs,
+    pol=None, lst_range=None, bl_vec=None, axes=None,
+    ft_freq=None, ft_time=None,
+    ):
+    """
+    Plot the match between the kernel and (inpainted) data in Fourier space
+
+    Parameters
+    ----------
+    data : tensor
+        Complex (inpainted) data visibilities of shape (Nbls, Ntimes, Nfreqs)
+    time_kernel : Kernel
+    freq_kernel : Kernel
+    times : tensor
+        Time array in seconds
+    freqs : tensor
+        Frequency array [MHz]
+    pol : str, optional
+        Polarization of data
+    lst_range : tuple, optional
+        Range of LSTs [hours] (start, stop)
+    bl_vec : tensor, optional
+        Baseline vector of data in ENU [meters]
+    axes : matplotlib.Axes
+    ft_freq : bayeslim.fft.FFT
+    ft_time : bayeslim.fft.FFT
+    """
+    import matplotlib.pyplot as plt
+    if lst_range is None:
+        lst_range = (0, 0)
+    if bl_vec is None:
+        bl_vec = [0, 0]
+    label = f"{pol} pol | {lst_range[0]:.1f}-{lst_range[1]:.1f} hrs LST | "\
+            f"{freqs[0]:.1f}-{freqs[-1]:.1f} MHz | {bl_vec[0]:.1f}, {bl_vec[1]:.1f} [m] bl"
+
+    if (ft_freq is None) or (ft_time is None):
+        from bayeslim.fft import FFT
+        if ft_freq is None:
+            ft_freq = FFT(dim=-1, N=len(freqs), ndim=2, window='bh', dx=freqs.diff()[0]/1e3)
+        if ft_time is None:
+            ft_time = FFT(dim=-2, N=len(times), ndim=2, window='bh', dx=times.diff()[0]/1e3)
+
+    if axes is None:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 3))
+
+    flags = torch.zeros(data.shape, dtype=bool)
+    noise = torch.ones(data.shape)
+
+    # rescale each kernel to data variance
+    time_kernel = models.fit_axis_kernel(
+        data, flags, noise, times, deepcopy(time_kernel), iters=0, rescale=True, 
+        prior_draws=100, var_mult=3,
+    )
+    freq_kernel = models.fit_axis_kernel(
+        data, flags, noise, freqs, deepcopy(freq_kernel), iters=0, rescale=True,
+        prior_draws=100, var_mult=3,
+    )
+
+    # draw 1D samples each
+    samples = models.prior_draws_1d(freq_kernel, freqs, size=100, jitter=1e-10)
+    axes[0].plot(ft_freq.freqs, ft_freq(data.mean(0)).abs().mean(0), label='data', c='k')
+    axes[0].plot(ft_freq.freqs, ft_freq(samples).abs().mean(0), label='samples', c='indianred');
+    axes[0].set_xlim(-3000, 3000); axes[0].set_xlabel('delay [nanosec]'); axes[0].set_yscale('log');
+    axes[0].grid()
+    axes[0].set_title(label, fontsize=9)
+
+    samples = models.prior_draws_1d(time_kernel, times, size=100, jitter=1e-10)[...,None]
+    axes[1].plot(ft_time.freqs, ft_time(data.mean(0)).abs().mean(1), label='data', c='k')
+    axes[1].plot(ft_time.freqs, ft_time(samples).abs().mean(0)[...,0], label='samples', c='indianred');
+    axes[1].set_xlim(-15, 15); axes[1].set_xlabel('fringe-rate [mHz]'); axes[1].set_yscale('log');
+    axes[1].grid()
+    axes[1].set_title(label, fontsize=9)
+
+    return axes
 
 
 

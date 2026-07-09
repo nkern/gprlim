@@ -653,6 +653,91 @@ class TwinRBFKernel(Kernel):
         return envelope * carrier
 
 
+class TwinSincKernel(Kernel):
+    r"""
+    A "twin sinc" kernel: a sinc (band-limited) envelope modulating a cosine, so that
+    the Fourier transform of the covariance (its PSD / delay spectrum) is two symmetric
+    rectangular bands at :math:`\pm\tau`,
+
+    .. math::
+        k(\Delta) = \operatorname{sinc}(\Delta/\ell)\,\cos(2\pi\,\tau\,\Delta),
+        \qquad
+        \mathrm{FT}[k](f) \propto \Pi\!\big(\ell (f-\tau)\big) + \Pi\!\big(\ell (f+\tau)\big),
+
+    where :math:`\operatorname{sinc}(z)=\sin(\pi z)/(\pi z)` and :math:`\Pi` is the unit
+    rectangle. This is the band-limited ("brick-wall") counterpart of
+    :class:`TwinRBFKernel`: the Gaussian envelope and Gaussian PSD peaks are replaced by
+    a sinc envelope and hard-edged rectangular bands, giving a sharp band edge and far
+    stronger out-of-band rejection than a Gaussian at the same center delay (the same way
+    :class:`SincKernel` is the band-limited counterpart of the RBF at DC).
+
+    With :math:`\Delta` a frequency separation, :math:`\tau` is the delay (its Fourier
+    conjugate), so the two bands sit at delay :math:`\pm\tau`, each a tophat of half-width
+    :math:`1/(2\ell)` (full width :math:`1/\ell`) -- equivalently a :class:`SincKernel`
+    band of lengthscale :math:`\ell` shifted onto :math:`\pm\tau`. Both bands are
+    non-negative, so the PSD is non-negative and the kernel is positive semi-definite
+    (this holds even when the bands overlap). ``k(0) = 1``; wrap in a ``ScaleKernel`` for
+    a learnable amplitude. The two bands are distinct (non-overlapping) once the envelope
+    spans at least half a carrier period, :math:`\ell\,\tau \gtrsim 1/2`; :math:`\tau = 0`
+    recovers the plain ``SincKernel``.
+
+    Parameters
+    ----------
+    tau : float
+        The (positive) delay / cosine frequency setting the band center. Learnable;
+        constrained positive by default.
+    lengthscale : float
+        The sinc envelope lengthscale; the band half-width is :math:`1/(2\ell)`.
+    tau_prior : gpytorch.priors.Prior, optional
+        Optional prior on ``tau``.
+    tau_constraint : gpytorch.constraints.Positive, optional
+        Optional constraint on ``tau`` (default ``Positive``).
+    """
+
+    has_lengthscale = True
+
+    def __init__(self, tau_prior=None, tau_constraint=None, **kwargs):
+        super().__init__(**kwargs)
+
+        self.register_parameter(
+            name="raw_tau",
+            parameter=torch.nn.Parameter(torch.zeros(*self.batch_shape, 1, 1)),
+        )
+        if tau_constraint is None:
+            tau_constraint = Positive()
+        self.register_constraint("raw_tau", tau_constraint)
+        if tau_prior is not None:
+            self.register_prior(
+                "tau_prior", tau_prior, lambda m: m.tau, lambda m, v: m._set_tau(v)
+            )
+
+    @property
+    def tau(self):
+        return self.raw_tau_constraint.transform(self.raw_tau)
+
+    @tau.setter
+    def tau(self, value):
+        self._set_tau(value)
+
+    def _set_tau(self, value):
+        if not torch.is_tensor(value):
+            value = torch.as_tensor(value).to(self.raw_tau)
+        self.initialize(raw_tau=self.raw_tau_constraint.inverse_transform(value))
+
+    def forward(self, x1, x2, diag=False, **params):
+        # sinc envelope: a rectangular (tophat) PSD of half-width 1/(2*lengthscale)
+        env = self.covar_dist(x1.div(self.lengthscale), x2.div(self.lengthscale),
+                              square_dist=False, diag=diag, **params)
+        envelope = torch.sinc(env)
+
+        # cosine carrier on the raw lag -> two tophat bands at +/- tau
+        dist = self.covar_dist(x1, x2, diag=diag, **params)
+        tau = self.tau[..., 0] if diag else self.tau
+        carrier = torch.cos(2 * np.pi * tau * dist)
+
+        return envelope * carrier
+
+
 class CarrierKernel(Kernel):
     r"""
     Modulate a real, even (stationary) base kernel by a complex carrier, producing a
@@ -1655,6 +1740,7 @@ def default_freq_kernel(
     pf_real=True,
     rf_scale=None,
     rf_tau=None,
+    rf_width=None,
     only_amp=True,
     only_global_amp=False,
     parameter=True):
@@ -1667,7 +1753,7 @@ def default_freq_kernel(
     3. SincKernel for -horizon < delays < horizon
     4. SincKernel for supra-horizon leakage or a wide
        TwinRBFKernel at pitchfork delays.
-    5. An optional set of reflection terms wrapped around 1-4.
+    5. SincKernel for reflection terms at +/- tau
 
     and 6. all wrapped by a universal ScaleKernel. The output kernel
     mixture takes frequency in MHz.
@@ -1713,6 +1799,8 @@ def default_freq_kernel(
         Amplitude of reflection term(s)
     rf_tau : float or list, optional
         Delay [micro-sec] of reflection term(s)
+    rf_width : float or list, optional
+        Reflection term delay width [micro-sec] (default 50e-3)
     only_amp : bool, optional
         If True (default) freeze every shape parameter (all lengthscales and
         carrier taus), leaving only the amplitudes (outputscales) free to fit.
@@ -1818,35 +1906,48 @@ def default_freq_kernel(
         supra_k.base_kernel.tau = horizon
         supra_k.outputscale = lk_scale
 
-    ## Sum the kernels
-    K = NamedAdditiveKernel(
-        {
+    kernels = {
         'mainlobe': ml,
         'pfork': pf,
         'wedge': wedge,
         'leakage': supra_k
-        }
-    )
-
-    ## 5. Reflection terms
+    }
+    
+    ## 5. Optional reflection terms
     if rf_scale is not None:
         assert rf_tau is not None
-        rf_scale = torch.as_tensor(rf_scale)
-        rf_tau = torch.as_tensor(rf_tau)
+        rf_scale = torch.atleast_1d(torch.as_tensor(rf_scale))
+        rf_tau = torch.atleast_1d(torch.as_tensor(rf_tau))
+        if rf_width is None:
+            rf_width = torch.ones_like(rf_tau) * 50e-3
+        rf_width = torch.atleast_1d(torch.as_tensor(rf_width))
+        rf_ls = 1 / rf_width
+        ref = None
+        for _amp, _tau, _ls in zip(rf_scale, rf_tau, rf_ls):
+            _ref = TwinSincKernel(
+                lengthscale_constraint=Interval(_ls * 0.8, _ls * 1.2),
+                lengthscale_prior=LogNormalPrior(np.log(_ls), 0.3),
+                tau_constraint=Interval(_tau * 0.8, _tau * 1.2),
+                tau_prior=NormalPrior(_tau, _tau * 0.1)
+            ).initialize(lengthscale=_ls, tau=_tau)
+            if only_amp or only_global_amp or not parameter:
+                _ref.raw_lengthscale.requires_grad_(False)
+                _ref.raw_tau.requires_grad_(False)
 
-        if rf_scale.numel() > 1:
-            for _amp, _tau, _phs in zip(rf_scale, rf_tau, rf_phs):
-                K = _wrap(
-                    K, _amp, _tau, _phs,
-                    only_amp=only_amp, only_global_amp=only_global_amp,
-                    parameter=parameter
-                )
+            _ref = ScaleKernel(
+                _ref,
+                outputscale_constraint=Interval(1e-8, 1e0),
+                outputscale_prior=LogNormalPrior(np.log(_amp), 0.5),
+            ).initialize(outputscale=_amp)
+            if only_global_amp or not parameter:
+                _ref.raw_outputscale.requires_grad_(False)
 
-        else:
-            K = _wrap(
-                K, rf_scale, rf_tau, rf_phs, only_amp=only_amp,
-                only_global_amp=only_global_amp, parameter=parameter
-            )
+            if ref is None:
+                ref = _ref
+            else:
+                ref = ref + _ref
+
+        kernels['ref'] = ref
 
     # deactivate parameters if desired
     if only_amp or only_global_amp or not parameter:
@@ -1873,7 +1974,7 @@ def default_freq_kernel(
 
     ## Add them all together with a universal scaling
     K = ScaleKernel(
-        K,
+        NamedAdditiveKernel(kernels),
         outputscale_constraint=Interval(1e-10, 1e10),
         outputscale_prior=LogNormalPrior(np.log(ml_scale), 5.0),
     )

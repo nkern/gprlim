@@ -53,6 +53,55 @@ def test_twin_rbf():
         assert torch.linalg.eigvalsh(kern(x[:, None]).to_dense()).min() > -1e-8
 
 
+def test_twin_sinc():
+    # sinc-windowed cosine sinc(Delta/ell) cos(2 pi tau Delta): the band-limited
+    # counterpart of TwinRBFKernel. Its PSD is two RECTANGULAR bands (tophats) centered
+    # at +/- tau, each of half-width 1/(2 ell) -- sharp edges, not Gaussian peaks.
+    tau, ell = 1.0, 2.0          # ell * tau = 2 > 1/2 so the two bands are distinct
+    half = 1.0 / (2.0 * ell)     # band half-width
+    kern = kernels.TwinSincKernel().double()
+    kern.tau = tau
+    kern.lengthscale = ell
+
+    with torch.no_grad():
+        # normalized to k(0) = 1
+        k0 = kern(torch.zeros(1, 1, dtype=torch.float64)).to_dense().squeeze()
+        assert torch.isclose(k0, torch.tensor(1.0, dtype=torch.float64))
+
+        # FT of the covariance (long lag window: the sinc envelope decays only ~1/Delta)
+        M, L = 8192, 200.0
+        lags = torch.linspace(-L, L, M, dtype=torch.float64)
+        klag = kern(lags[:, None], torch.zeros(1, 1, dtype=torch.float64)).to_dense().squeeze()
+        freq = np.fft.fftshift(np.fft.fftfreq(M, d=float(lags[1] - lags[0])))
+        psd = np.fft.fftshift(np.abs(np.fft.fft(np.fft.ifftshift(klag.numpy()))))
+        psd = psd / psd.max()
+
+        # rectangular bands: the >half-max region is the two tophats, so its outer edges
+        # sit at +/-(tau + half) and its DC gap (|f| < tau - half) is excluded. The edge
+        # location encodes the tophat WIDTH -- a Gaussian TwinRBF would fail it (its half-
+        # max half-width is 0.375/ell, not the tophat's 0.5/ell).
+        band = freq[psd > 0.5]
+        assert np.isclose(band.max(),  (tau + half), atol=0.03)
+        assert np.isclose(band.min(), -(tau + half), atol=0.03)
+        assert psd[np.argmin(np.abs(freq))] < 0.5               # gap at DC (bands distinct)
+
+        # flat top (a tophat, not a peak): the in-band value near the edge ~ the center
+        c = psd[np.argmin(np.abs(freq - tau))]
+        e = psd[np.argmin(np.abs(freq - (tau + 0.5 * half)))]
+        assert e > 0.7 * c
+
+        # positive semi-definite
+        x = torch.linspace(0, 20, 100, dtype=torch.float64)
+        assert torch.linalg.eigvalsh(kern(x[:, None]).to_dense()).min() > -1e-8
+
+    # tau = 0 recovers the plain SincKernel
+    k0 = kernels.TwinSincKernel().double(); k0.tau = 0.0; k0.lengthscale = ell
+    sinc = kernels.SincKernel().double(); sinc.lengthscale = ell
+    xs = torch.linspace(0, 15, 40, dtype=torch.float64)[:, None]
+    with torch.no_grad():
+        assert torch.allclose(k0(xs).to_dense(), sinc(xs).to_dense(), atol=1e-9)
+
+
 def test_gauss_sinc_kernel():
     # wraps gauss_sinc_cov: stationary, normalized, PSD, exact cross-covariance
     kern = kernels.GaussSincKernel(1.0, 2.0)
