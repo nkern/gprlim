@@ -12,14 +12,14 @@ def hera_inpaint(
     data,
     noise_var,
     flags,
-    bl_vec,
-    lat,
     times,
     freqs,
+    inpaint='2d_1d',
+    norm_freq_alpha=-2.0,
     time_kernel=None,
     freq_kernel=None,
-    norm_freq_alpha=-2.0,
-    inpaint='2d_1d',
+    bl_vec=None,
+    lat=None,
     fr_buffer=1.0,
     fr_scale=3e-3,
     fz_scale=1e-1,
@@ -57,23 +57,10 @@ def hera_inpaint(
         Flagged pixels must have a large noise variance.
     flags : tensor
         Visibility flags to inpaint over.
-    bl_vec : tensor
-        Baseline vector (E, N, U) of this redundnat set [meters].
-    lat : float
-        Latitude of observer in degrees
     times : tensor
         Time integration of visibilities along Ntimes [seconds]
     freqs : tensor
         Frequency bins of visibilities along Nfreqs [MHz]
-    time_kernel : Kernel
-        Pre-built time kernel. Supersedes build_kernels() parameters.
-    freq_kernel : Kernel
-        Pre-built freq kernel. Supersedes build_kernels() parameters.
-    norm_freq_alpha : float, optional
-        If provided, normalize input data and noise amplitude
-        by a powerlaw with this spectral index (default=-2.0)
-        before inpainting, un-normalize before returning.
-        Pass as None or 1.0 for no effect.
     inpaint : str, optional
         Inpainting method. ['2d', '2d_1d', '1d_1d', 'time', 'freq'].
             '2d'    : time + freq 2d inpaint
@@ -81,7 +68,19 @@ def hera_inpaint(
             '1d_1d' : 1d time inpaint, then 1d freq inpaint
             'time'  : 1d time inpaint
             'freq'  : 1d freq inpaint
-
+    norm_freq_alpha : float, optional
+        If provided, normalize input data and noise amplitude
+        by a powerlaw with this spectral index (default=-2.0)
+        before inpainting, un-normalize before returning.
+        Pass as None or 1.0 for no effect.
+    time_kernel : Kernel
+        Pre-built time kernel. Supersedes build_kernels() parameters.
+    freq_kernel : Kernel
+        Pre-built freq kernel. Supersedes build_kernels() parameters.
+    bl_vec : tensor
+        Baseline vector (E, N, U) of this redundnat set [meters].
+    lat : float
+        Latitude of observer in degrees
     fr_buffer, fr_scale, fz_scale, pf_scale, wd_scale, lk_scale, lk_buffer, kernel_var_mult : optional
         Time / frequency kernel shape amplitudes and the fit-variance multiple, forwarded to
         :func:`build_kernels` (used only when ``time_kernel`` / ``freq_kernel`` are not given).

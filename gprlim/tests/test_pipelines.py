@@ -21,7 +21,8 @@ def test_hera_inpaint_modes(mode):
     noise = noise.clone(); noise[flags] = 1e12                       # caller down-weights flags
 
     inp_y, mdl = pipelines.hera_inpaint(
-        data, noise, flags, BL_VECS, LAT, t, nu, inpaint=mode, n_threads=1, cg_tol=1e-3,
+        data, noise, flags, t, nu, inpaint=mode, n_threads=1, cg_tol=1e-3,
+        bl_vec=BL_VECS, lat=LAT, 
     )
 
     assert inp_y.shape == data.shape and inp_y.is_complex()
