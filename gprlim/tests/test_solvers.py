@@ -129,14 +129,14 @@ def test_kron_matvec(cplx):
 
 
 @pytest.mark.parametrize("cplx", [False, True])
-def test_kron_eigen_preconditioner(cplx):
+def test_kron_homoscedastic_preconditioner(cplx):
     Nt, Nf = 6, 5
     P, F = _kron_cores(Nt, Nf, cplx)
     shift = 0.7
     v = _vec((Nt * Nf,), cplx, 3)
     Ks = _kron_dense(P, F)
     ref = torch.linalg.solve(Ks + shift * torch.eye(Nt * Nf, dtype=Ks.dtype), v)
-    assert torch.allclose(solvers.kron_eigen_preconditioner(P, F, shift=shift)(v), ref, atol=1e-8)
+    assert torch.allclose(solvers.kron_homoscedastic_preconditioner(P, F, shift=shift)(v), ref, atol=1e-8)
 
 
 @pytest.mark.parametrize("cplx", [False, True])
@@ -152,19 +152,19 @@ def test_pcg_kron_unpreconditioned(cplx):
     assert torch.allclose(x, ref, atol=1e-6)
 
 
-def test_kron_eigen_preconditioner_accelerates():
+def test_kron_homoscedastic_preconditioner_accelerates():
     # the structured preconditioner should cut CG iterations vs none
     Nt, Nf = 10, 9
     P, F = _kron_cores(Nt, Nf, True, seed=20)
     noise = 0.01 * torch.ones(Nt * Nf, dtype=DOUBLE)
     A, b = solvers.kron_matvec(P, F, diag=noise), _vec((Nt * Nf,), True, 21)
     _, none = solvers.pcg(A, b, tol=1e-8, max_iter=3000)
-    _, pc = solvers.pcg(A, b, M=solvers.kron_eigen_preconditioner(P, F, shift=0.01), tol=1e-8, max_iter=3000)
+    _, pc = solvers.pcg(A, b, M=solvers.kron_homoscedastic_preconditioner(P, F, shift=0.01), tol=1e-8, max_iter=3000)
     assert pc["iters"] < none["iters"]
 
 
 @pytest.mark.parametrize("cplx", [False, True])
-def test_kron_blockdiag_preconditioner(cplx):
+def test_kron_heteroscedastic_preconditioner(cplx):
     # M^-1 for M = P (x) F + I (x) diag(Df): inverts M exactly (dense reference), real & complex P
     Nt, Nf = 6, 5
     P, F = _kron_cores(Nt, Nf, cplx)
@@ -173,44 +173,90 @@ def test_kron_blockdiag_preconditioner(cplx):
     Ks = _kron_dense(P, F)
     M = Ks + torch.kron(torch.eye(Nt, dtype=Ks.dtype), torch.diag(Df).to(Ks.dtype))
     ref = torch.linalg.solve(M, v.unsqueeze(-1)).squeeze(-1)
-    assert torch.allclose(solvers.kron_blockdiag_preconditioner(P, F, Df)(v), ref, atol=1e-8)
+    assert torch.allclose(solvers.kron_heteroscedastic_preconditioner(P, F, Df)(v), ref, atol=1e-8)
 
 
-def test_kron_blockdiag_preconditioner_accelerates():
-    # for time-separable noise (I (x) diag(Df)) the block-diag preconditioner is the EXACT inverse,
-    # so preconditioned CG converges in ~1 iteration -- far fewer than the scalar-shift eigen one
+def test_kron_heteroscedastic_preconditioner_accelerates():
+    # for time-separable noise (I (x) diag(Df)) the heteroscedastic preconditioner is the EXACT inverse,
+    # so preconditioned CG converges in ~1 iteration -- far fewer than the scalar-shift homoscedastic one
     Nt, Nf = 12, 10
     P, F = _kron_cores(Nt, Nf, True, seed=7)
     Df = torch.full((Nf,), 1e-3, dtype=DOUBLE); Df[3:6] = 1e8       # a fully-flagged channel "gap"
     noise = Df.expand(Nt, Nf).reshape(-1)                          # separable: same Df at every time
     A, b = solvers.kron_matvec(P, F, diag=noise), _vec((Nt * Nf,), True, 8)
-    _, eig = solvers.pcg(A, b, M=solvers.kron_eigen_preconditioner(P, F, shift=float(Df.min())),
+    _, eig = solvers.pcg(A, b, M=solvers.kron_homoscedastic_preconditioner(P, F, shift=float(Df.min())),
                          tol=1e-8, max_iter=3000, weight=noise.reciprocal())
-    _, bd = solvers.pcg(A, b, M=solvers.kron_blockdiag_preconditioner(P, F, Df),
+    _, bd = solvers.pcg(A, b, M=solvers.kron_heteroscedastic_preconditioner(P, F, Df),
                         tol=1e-8, max_iter=3000, weight=noise.reciprocal())
     assert bd["iters"] <= 2 and bd["iters"] < eig["iters"]
 
 
 @pytest.mark.parametrize("cplx", [False, True])
-def test_kron_sparse_blockdiag_preconditioner(cplx):
-    # low-rank form of the blockdiag preconditioner: with rcond=0 (all signal modes kept) it applies
-    # the SAME M^-1 as kron_blockdiag_preconditioner (background r/Df + full correction).
+def test_kron_separable_preconditioner(cplx):
+    # both-axis (separable) generalization: M = P (x) F + diag(Dt) (x) diag(Df) inverted exactly;
+    # Dt=None recovers the per-channel form M = P (x) F + I (x) diag(Df).
+    Nt, Nf = 7, 6
+    P, F = _kron_cores(Nt, Nf, cplx)
+    Dt = 0.1 + torch.rand(Nt, dtype=DOUBLE)
+    Df = 0.1 + torch.rand(Nf, dtype=DOUBLE)
+    v = _vec((3, Nt * Nf), cplx, 5)
+    Ks = _kron_dense(P, F)
+    M = Ks + torch.kron(torch.diag(Dt).to(Ks.dtype), torch.diag(Df).to(Ks.dtype))
+    ref = torch.linalg.solve(M, v.unsqueeze(-1)).squeeze(-1)
+    got = solvers.kron_heteroscedastic_preconditioner(P, F, Df, Dt=Dt)(v)
+    assert torch.allclose(got, ref, atol=1e-8)                    # exact inverse for separable noise
+
+    Mnone = Ks + torch.kron(torch.eye(Nt, dtype=Ks.dtype), torch.diag(Df).to(Ks.dtype))
+    ref_none = torch.linalg.solve(Mnone, v.unsqueeze(-1)).squeeze(-1)
+    assert torch.allclose(solvers.kron_heteroscedastic_preconditioner(P, F, Df)(v), ref_none, atol=1e-8)
+
+
+def test_kron_separable_preconditioner_accelerates():
+    # full-TIME flags (whole integrations flagged at every freq) are captured by the Dt factor, which
+    # the per-channel-only (Df) preconditioner MISSES -> far fewer CG iterations, same solution.
+    Nt, Nf = 16, 12
+    P, F = _kron_cores(Nt, Nf, True, seed=13)
+    noise = torch.full((Nt, Nf), 1e-3, dtype=DOUBLE)
+    noise[:, 3:5] = 1e8                                           # full-channel flags
+    noise[[2, 7, 11], :] = 1e8                                    # full-TIME stripes
+    nz = noise.reshape(-1)
+    A, b, w = solvers.kron_matvec(P, F, diag=nz), _vec((Nt * Nf,), True, 14), nz.reciprocal()
+    gmin, Df, Dt = noise.min(), noise.amin(dim=0), noise.amin(dim=1)
+    x_chan, chan = solvers.pcg(A, b, M=solvers.kron_heteroscedastic_preconditioner(P, F, Df),
+                               tol=1e-8, max_iter=3000, weight=w)           # per-channel only
+    x_sep, sep = solvers.pcg(A, b, M=solvers.kron_heteroscedastic_preconditioner(P, F, Df / gmin, Dt=Dt),
+                             tol=1e-8, max_iter=3000, weight=w)             # separable (captures stripes)
+    assert torch.allclose(x_sep, x_chan, atol=1e-6)              # a preconditioner never changes the answer
+    assert sep["iters"] < chan["iters"]                          # ... only the iteration count
+
+
+@pytest.mark.parametrize("cplx", [False, True])
+def test_kron_sparse_heteroscedastic_preconditioner(cplx):
+    # low-rank form of the heteroscedastic preconditioner: with rcond=0 (all signal modes kept) it applies
+    # the SAME M^-1 as kron_heteroscedastic_preconditioner (background r/Df + full correction).
     Nt, Nf = 7, 6
     P, F = _kron_cores(Nt, Nf, cplx)
     Df = 0.1 + torch.rand(Nf, dtype=DOUBLE)
     v = _vec((3, Nt * Nf), cplx, 4)
-    full = solvers.kron_blockdiag_preconditioner(P, F, Df)
-    sparse0 = solvers.kron_sparse_blockdiag_preconditioner(P, F, Df, rcond=0.0)
-    assert (sparse0(v) - full(v)).abs().max() < 1e-8              # rcond=0 == full blockdiag apply
+    full = solvers.kron_heteroscedastic_preconditioner(P, F, Df)
+    sparse0 = solvers.kron_sparse_heteroscedastic_preconditioner(P, F, Df, rcond=0.0)
+    assert (sparse0(v) - full(v)).abs().max() < 1e-8              # rcond=0 == full heteroscedastic apply
 
-    # end-to-end: precond='sparse_blockdiag' low-ranks BOTH the operator (matvec) and the
+    # separable (both-axis) form: with Dt given, the background is r/(Dt (x) Df) and rcond=0 still
+    # matches the dense separable M^-1 (captures full-time flags as well as full-channel)
+    Dt = 0.1 + torch.rand(Nt, dtype=DOUBLE)
+    full_s = solvers.kron_heteroscedastic_preconditioner(P, F, Df, Dt=Dt)
+    sparse_s = solvers.kron_sparse_heteroscedastic_preconditioner(P, F, Df, Dt=Dt, rcond=0.0)
+    assert (sparse_s(v) - full_s(v)).abs().max() < 1e-8          # rcond=0 == full separable apply
+
+    # end-to-end: precond='sparse_separable' low-ranks BOTH the operator (matvec) and the
     # preconditioner; at sparse_rcond=0 (all positive modes kept) both are exact, so the CG solve
     # reaches the dense Wiener mean.
     y = _vec((Nt, Nf), cplx, 9)
     flags = torch.zeros(Nt, Nf, dtype=bool); flags[:, 2:4] = True   # a fully-flagged channel gap
     noise = 0.1 * torch.ones(Nt, Nf, dtype=DOUBLE); noise[flags] = 1e6
     m, info = solvers.kron_wiener_cg(P, F, noise, y, tol=1e-9, max_iter=2000,
-                                     precond='sparse_blockdiag', sparse_rcond=0.0)
+                                     precond='sparse_separable', sparse_rcond=0.0)
     assert torch.allclose(m, _dense_wiener(P, F, noise, y), atol=1e-5)
     assert info["iters"] < 2000                                    # converged
 

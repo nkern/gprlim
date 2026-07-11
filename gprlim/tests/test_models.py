@@ -521,11 +521,11 @@ def test_posterior_mean_pred_kernel():
 	assert mt.shape == y2.shape
 
 
-def test_precond_blockdiag_matches_eigen():
-    """The 'blockdiag' and 'sparse_blockdiag' CG preconditioners return the SAME posterior mean as
-    the default 'eigen' one (to cg_tol) for separable, non-separable, and mixed flag patterns, and
-    'blockdiag' reverts to 'eigen' bit-for-bit when no whole channel is flagged. A preconditioner
-    never changes the solution."""
+def test_precond_heteroscedastic_matches_homoscedastic():
+    """The 'separable' and 'sparse_separable' CG preconditioners return the SAME posterior mean as
+    the 'scalar' one (to cg_tol) for separable, non-separable, mixed, and full-time-stripe flag
+    patterns, and 'separable' reverts to 'scalar' bit-for-bit when neither a whole channel
+    nor a whole time is flagged. A preconditioner never changes the solution."""
     torch.manual_seed(0)
     Nb, N1, N2 = 2, 50, 64
     x1 = torch.linspace(0, 25, N1, dtype=torch.float64)
@@ -538,18 +538,19 @@ def test_precond_blockdiag_matches_eigen():
     scat = torch.full((Nb, N1, N2), 1e-3, dtype=torch.float64)
     scat[torch.rand(Nb, N1, N2) < 0.05] = 1e10                                          # scattered, no full channel
     mixed = sep.clone(); mixed[torch.rand(Nb, N1, N2) < 0.03] = 1e10                     # gap + scatter
+    stripe = sep.clone(); stripe[:, [10, 30], :] = 1e10                                  # full-channel gap + full-TIME stripes
 
     kw = dict(method='cg', cg_tol=1e-5, cg_max_iter=8000)
-    for name, noise in [('separable', sep), ('scatter', scat), ('mixed', mixed)]:
-        m_eig = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='eigen', **kw)[0]
-        m_bd = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='blockdiag', **kw)[0]
-        m_sp = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='sparse_blockdiag', **kw)[0]
+    for name, noise in [('separable', sep), ('scatter', scat), ('mixed', mixed), ('stripe', stripe)]:
+        m_eig = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='scalar', **kw)[0]
+        m_bd = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='separable', **kw)[0]
+        m_sp = posterior_mean_2d(k1, k2, x1, x2, y, noise, precond='sparse_separable', **kw)[0]
         assert torch.allclose(m_bd, m_eig, atol=1e-4), (name, (m_bd - m_eig).abs().max())
         assert torch.allclose(m_sp, m_eig, atol=1e-4), ('sparse', name, (m_sp - m_eig).abs().max())
 
-    # no fully-flagged channel -> blockdiag reverts to eigen exactly (bit-for-bit)
-    m_eig = posterior_mean_2d(k1, k2, x1, x2, y, scat, precond='eigen', **kw)[0]
-    m_bd = posterior_mean_2d(k1, k2, x1, x2, y, scat, precond='blockdiag', **kw)[0]
+    # no fully-flagged channel -> heteroscedastic reverts to homoscedastic exactly (bit-for-bit)
+    m_eig = posterior_mean_2d(k1, k2, x1, x2, y, scat, precond='scalar', **kw)[0]
+    m_bd = posterior_mean_2d(k1, k2, x1, x2, y, scat, precond='separable', **kw)[0]
     assert (m_bd - m_eig).abs().max().item() == 0.0
     with pytest.raises(ValueError):
         posterior_mean_2d(k1, k2, x1, x2, y, sep, precond='nope', **kw)

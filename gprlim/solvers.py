@@ -12,7 +12,7 @@ The structured Kronecker routines never densify the unraveled
 
 * :func:`pcg` -- preconditioned CG for Hermitian PD systems, real or complex, through a
   matmul-only interface, with pluggable dense / structured preconditioners
-  (:func:`kron_eigen_preconditioner`, :func:`dense_preconditioner`, ...). ``linear_operator``'s
+  (:func:`kron_homoscedastic_preconditioner`, :func:`dense_preconditioner`, ...). ``linear_operator``'s
   own CG is real-only (it compares a complex residual norm with ``<``), so this is what
   the complex CarrierKernel covariances need. Accuracy is set by the CG tolerance, not a
   rank cutoff -- the right tool when the kernel's dynamic range is too high to truncate.
@@ -182,7 +182,7 @@ def pcg(A, b, M=None, tol=1e-6, max_iter=1000, x0=None, weight=None):
         Right-hand side(s) of shape (..., n): the last axis is the system, any leading
         axes are independent batched solves.
     M : callable, optional
-        Preconditioner applying ``r -> M^-1 r`` (e.g. :func:`kron_eigen_preconditioner`,
+        Preconditioner applying ``r -> M^-1 r`` (e.g. :func:`kron_homoscedastic_preconditioner`,
         :func:`dense_preconditioner`, :func:`diag_preconditioner`). Default: identity.
     tol : float
         Relative-residual tolerance ``||b - A x|| / ||b||``; stop when every row meets it.
@@ -266,11 +266,11 @@ def operator_preconditioner(linop):
     return lambda r: linop.solve(r.unsqueeze(-1)).squeeze(-1)
 
 
-def kron_eigen_preconditioner(Ct, Cf, shift=0.0):
+def kron_homoscedastic_preconditioner(Ct, Cf, shift=0.0):
     r"""
     Structured (no-densify) preconditioner for ``M = Ct (x) Cf + shift * I``, via the
-    per-axis eigendecompositions -- the natural preconditioner for a Kronecker signal
-    covariance plus a (scalar) noise floor. With ``shift`` set to the good-pixel noise
+    per-axis eigendecompositions -- the *homoscedastic* case: a Kronecker signal
+    covariance plus a single (scalar) noise floor ``shift``. With ``shift`` set to the good-pixel noise
     variance, ``M`` captures the smooth covariance *and its full dynamic range* exactly,
     so CG only has to resolve the (low-rank) flagged correction.
 
@@ -313,28 +313,28 @@ def kron_eigen_preconditioner(Ct, Cf, shift=0.0):
     return apply_Minv
 
 
-def kron_blockdiag_preconditioner(Ct, Cf, Df):
+def kron_heteroscedastic_preconditioner(Ct, Cf, Df, Dt=None):
     r"""
-    Structured (no-densify) preconditioner for ``M = Ct (x) Cf + I (x) diag(Df)`` -- the natural
-    preconditioner when the noise is *separable across the outer (time) axis*: whole inner-axis
-    (frequency) channels flagged the same way at every time, so ``diag(noise) = I (x) diag(Df)``
-    with ``Df`` the per-channel noise (large on fully-flagged channels).
+    Structured (no-densify) preconditioner for ``M = Ct (x) Cf + diag(Dt) (x) diag(Df)`` -- the
+    *heteroscedastic* case, a Kronecker signal covariance plus a **separable** (rank-1) noise floor
+    ``noise[t, f] = Dt[t] * Df[f]``. This carries the fully-flag structure exactly on BOTH axes:
+    whole inner-axis (frequency) **channels** flagged at every time (``Df`` large) AND whole
+    outer-axis (time) **integrations** flagged at every frequency (``Dt`` large). Their union is
+    exactly rank-1, so ``M`` matches such flags exactly and preconditioned CG converges in a handful
+    of iterations -- a single iteration (``M`` is then the exact inverse) when the noise is exactly
+    separable. ``Dt=None`` is the time-independent (per-channel-only) special case ``I (x) diag(Df)``.
 
-    Unlike the scalar-shift :func:`kron_eigen_preconditioner`, this carries the *full-channel
-    flag structure exactly*, so preconditioned CG converges in a handful of iterations -- and in
-    a single iteration (it is then the exact inverse) when the noise is exactly separable.
-
-    Mechanism: ``M`` block-diagonalizes in the eigenbasis of ``Ct = Qt diag(lam_t) Qt^H``,
-    ``(Qt^H (x) I) M (Qt (x) I) = blockdiag_i( lam_t[i] Cf + diag(Df) )``. Rather than factor each
-    of the ``Ntimes`` blocks separately (that costs ``Ntimes`` ``Nfreqs x Nfreqs`` solves *per
-    apply* -- which for large ``Nfreqs`` can dominate and make CG net-slower than the scalar-shift
-    preconditioner despite fewer iterations), whiten once: ``Ctil = Df^-1/2 Cf Df^-1/2 =
-    V diag(nu) V^H`` shares its eigenvectors across every block, so ``B_i^-1 = G diag(1 /
-    (lam_t[i] nu + 1)) G^H`` with ``G = Df^-1/2 V``. Then ``M^-1 r`` is a rotate by ``Qt^H`` (outer
-    axis) and ``G^H`` (inner axis), an elementwise divide by ``lam_t (x) nu + 1``, and the two
-    rotates back -- FOUR small matmuls, the same per-apply cost as :func:`kron_eigen_preconditioner`.
-    Every block is Hermitian PD (``Df > 0``, ``lam_t`` clamped at 0 so ``nu >= 0``), so the divisor
-    is ``>= 1`` and it never breaks down.
+    Mechanism: whiten each axis by its noise floor and diagonalize once. With ``Wt = Dt^-1/2``,
+    ``Wf = Df^-1/2``, ``(Wt (x) Wf) M (Wt (x) Wf) = Ctil (x) Cfil + I (x) I`` where
+    ``Ctil = Wt Ct Wt = Ut diag(mu_t) Ut^H`` and ``Cfil = Wf Cf Wf = Uf diag(mu_f) Uf^H`` share
+    their eigenvectors across the whole grid. So ``M^-1 r`` is a rotate by ``Gt^H = (Wt Ut)^H``
+    (outer axis) and ``Gf^H = (Wf Uf)^H`` (inner axis), an elementwise divide by
+    ``mu_t (x) mu_f + 1``, and the two rotates back -- FOUR small matmuls, the same per-apply cost as
+    :func:`kron_homoscedastic_preconditioner` (``Dt=None`` skips the outer whitening, rotating by
+    ``Ct``'s own eigenvectors). The divisor is ``>= 1`` (``mu_t, mu_f >= 0``, ``Dt, Df > 0``), so it
+    never breaks down. Non-separable structure (scattered flags, PARTIALLY-flagged channels/times,
+    non-separable noise) is not captured and is left to CG -- a preconditioner never changes the
+    solution, only the iteration count.
 
     Parameters
     ----------
@@ -343,8 +343,14 @@ def kron_blockdiag_preconditioner(Ct, Cf, Df):
     Cf : tensor
         Inner/frequency-axis kernel, Hermitian PSD (Nfreqs, Nfreqs).
     Df : tensor
-        Per-inner-channel noise variance (Nfreqs,), strictly positive -- the time-independent
-        part of the noise (fully-flagged channels carry the large value).
+        Per-inner-channel noise floor (Nfreqs,), strictly positive (fully-flagged channels carry
+        the large value).
+    Dt : tensor, optional
+        Per-outer-time noise floor (Ntimes,), strictly positive (fully-flagged time integrations
+        carry the large value). Default None -> ``Dt = 1`` (the per-channel-only case ``I (x)
+        diag(Df)``). When given, the caller must normalize so ``Dt (x) Df`` reproduces the intended
+        floor (e.g. ``Df/gmin`` with ``gmin`` the global good-pixel value, so good pixels read
+        ``gmin`` not ``gmin^2``).
 
     Returns
     -------
@@ -354,57 +360,69 @@ def kron_blockdiag_preconditioner(Ct, Cf, Df):
     dt = torch.promote_types(Ct.dtype, Cf.dtype)
     Ct, Cf = Ct.to(dt), Cf.to(dt)
     Ntimes, Nfreqs = Ct.shape[-1], Cf.shape[-1]
-    lam_t, Qt = torch.linalg.eigh(Ct)
-    lam_t = lam_t.clamp_min(0)                                     # PSD blocks even for tiny negative eig
-    # whiten Cf by the per-channel noise and diagonalize ONCE: Ctil = Df^-1/2 Cf Df^-1/2 = V nu V^H.
-    # every block  B_i = lam_t[i] Cf + diag(Df)  then shares eigenvectors G = Df^-1/2 V, with
-    # B_i^-1 = G diag(1 / (lam_t[i] nu + 1)) G^H -- so M^-1 is four matmuls, not Ntimes block solves.
-    dinv = Df.rsqrt().to(dt)                                       # Df^-1/2
-    nu, V = torch.linalg.eigh(dinv[:, None] * Cf * dinv[None, :])
-    G = dinv[:, None] * V                                          # Df^-1/2 V, (Nfreqs, Nfreqs)
-    denom = lam_t[:, None] * nu.clamp_min(0)[None, :] + 1.0        # blocks' eigenvalues, (Ntimes, Nfreqs)
-    QtH, Gc, GT = Qt.conj().transpose(-1, -2), G.conj(), G.transpose(-1, -2)
+
+    # inner (frequency) axis: whiten by Df^-1/2 and diagonalize ONCE -> Gf = Df^-1/2 Uf
+    df_inv = Df.rsqrt().to(dt)
+    mu_f, Uf = torch.linalg.eigh(df_inv[:, None] * Cf * df_inv[None, :])
+    Gf = df_inv[:, None] * Uf
+
+    # outer (time) axis: Dt=None -> rotate by Ct's own eigenvectors (per-channel-only, I (x) diag(Df));
+    # Dt given -> ALSO whiten by Dt^-1/2 so full-TIME flags are captured too -> Gt = Dt^-1/2 Ut
+    if Dt is None:
+        mu_t, Ut = torch.linalg.eigh(Ct)
+        Gt = Ut
+    else:
+        dt_inv = Dt.rsqrt().to(dt)
+        mu_t, Ut = torch.linalg.eigh(dt_inv[:, None] * Ct * dt_inv[None, :])
+        Gt = dt_inv[:, None] * Ut
+
+    denom = mu_t.clamp_min(0)[:, None] * mu_f.clamp_min(0)[None, :] + 1.0   # (Ntimes, Nfreqs)
+    GtH, Gfc, GfT = Gt.conj().transpose(-1, -2), Gf.conj(), Gf.transpose(-1, -2)
 
     def apply_Minv(r):
         R = r.reshape(*r.shape[:-1], Ntimes, Nfreqs)
-        Rt = QtH @ R                                              # (Qt^H (x) I) r -- rotate outer axis
-        Xt = ((Rt @ Gc) / denom) @ GT                            # whiten inner axis, divide, un-whiten
-        return (Qt @ Xt).reshape(*r.shape[:-1], Ntimes * Nfreqs)  # rotate back
+        X = (GtH @ R @ Gfc) / denom                              # rotate both axes in, divide
+        return (Gt @ X @ GfT).reshape(*r.shape[:-1], Ntimes * Nfreqs)   # rotate both back
     return apply_Minv
 
 
-def kron_sparse_blockdiag_preconditioner(Ct, Cf, Df, rcond=1e-12):
+def kron_sparse_heteroscedastic_preconditioner(Ct, Cf, Df, Dt=None, rcond=1e-12):
     r"""
-    Low-rank ("sparse") variant of :func:`kron_blockdiag_preconditioner` for
-    ``M = Ct (x) Cf + I (x) diag(Df)`` -- the SAME preconditioner, but applied as a cheap diagonal
-    background plus a rank-``(r_t*r_f)`` correction touching only the signal modes, so the apply
-    costs ``O(Ntimes*Nfreqs*(r_t+r_f))`` instead of ``O(Ntimes*Nfreqs*(Ntimes+Nfreqs))`` -- a large
-    per-iteration win when the kernels are low rank (smooth / band-limited).
+    Low-rank ("sparse") variant of :func:`kron_heteroscedastic_preconditioner` for the separable
+    ``M = Ct (x) Cf + diag(Dt) (x) diag(Df)`` -- the SAME preconditioner, but applied as a cheap
+    diagonal background plus a rank-``(r_t*r_f)`` correction touching only the signal modes, so the
+    apply costs ``O(Ntimes*Nfreqs*(r_t+r_f))`` instead of ``O(Ntimes*Nfreqs*(Ntimes+Nfreqs))`` -- a
+    large per-iteration win when the kernels are low rank (smooth / band-limited).
 
-    In the block-diagonal form the per-block spectrum ``denom = lam_t (x) nu + 1`` is *exactly 1*
-    off the ``r_t x r_f`` signal block (null time modes have ``lam_t = 0``; null whitened-freq modes
-    have ``nu = 0``). Splitting ``1/denom = 1 + (1/denom - 1)`` gives
+    Whiten each axis by its noise floor and diagonalize; the spectrum ``denom = mu_t (x) mu_f + 1``
+    is *exactly 1* off the ``r_t x r_f`` signal block (null time modes have ``mu_t = 0``; null
+    whitened-freq modes have ``mu_f = 0``). Splitting ``1/denom = 1 + (1/denom - 1)`` gives
 
-        ``M^-1 r = r/Df  +  Q_t,r [ (Q_t,r^H R G_r^*) (x) (1/denom_r - 1) ] G_r^T``
+        ``M^-1 r = r / (Dt (x) Df)  +  G_t,r [ (G_t,r^H R G_f,r^*) (x) (1/denom_r - 1) ] G_f,r^T``
 
-    -- a diagonal background ``r/Df`` (which carries the full-channel flags, same as
-    :func:`kron_blockdiag_preconditioner`) plus a correction over only the ``r_t`` time and ``r_f``
-    whitened-freq eigenmodes kept at ``rcond``. Exact in the limit ``rcond -> 0`` (all modes kept);
-    at a finite ``rcond`` it is a slightly weaker preconditioner, which (like any preconditioner)
-    changes only the CG iteration count, never the solution.
+    -- a diagonal background ``r / (Dt (x) Df)`` (which carries the full-channel AND full-time flags,
+    same as :func:`kron_heteroscedastic_preconditioner`) plus a correction over only the ``r_t`` time
+    and ``r_f`` whitened-freq eigenmodes kept at ``rcond``. ``Dt=None`` is the per-channel-only case
+    (background ``r/Df``, time rotated by ``Ct``'s own eigenvectors). Exact in the limit
+    ``rcond -> 0`` (all modes kept); at a finite ``rcond`` it is a slightly weaker preconditioner,
+    which (like any preconditioner) changes only the CG iteration count, never the solution.
 
     Parameters
     ----------
     Ct, Cf : tensor
         Outer/time and inner/frequency kernels, Hermitian PSD (Ntimes, Ntimes) / (Nfreqs, Nfreqs).
     Df : tensor
-        Per-inner-channel noise variance (Nfreqs,), strictly positive (fully-flagged channels
-        carry the large value).
+        Per-inner-channel noise floor (Nfreqs,), strictly positive (fully-flagged channels carry
+        the large value).
+    Dt : tensor, optional
+        Per-outer-time noise floor (Ntimes,), strictly positive (fully-flagged time integrations
+        carry the large value). Default None -> the per-channel-only case ``I (x) diag(Df)``. When
+        given, normalize as for :func:`kron_heteroscedastic_preconditioner` (e.g. ``Df/gmin``).
     rcond : float
         Relative eigenvalue cutoff for the low-rank correction: keep time modes with
-        ``lam_t > rcond * lam_t_max`` and whitened-freq modes with ``nu > rcond * nu_max``. Smaller
+        ``mu_t > rcond * mu_t_max`` and whitened-freq modes with ``mu_f > rcond * mu_f_max``. Smaller
         keeps more modes (stronger preconditioner, costlier apply); larger is cheaper but may add
-        CG iterations. ``rcond -> 0`` recovers :func:`kron_blockdiag_preconditioner` exactly.
+        CG iterations. ``rcond -> 0`` recovers :func:`kron_heteroscedastic_preconditioner`.
 
     Returns
     -------
@@ -414,25 +432,36 @@ def kron_sparse_blockdiag_preconditioner(Ct, Cf, Df, rcond=1e-12):
     dt = torch.promote_types(Ct.dtype, Cf.dtype)
     Ct, Cf = Ct.to(dt), Cf.to(dt)
     Ntimes, Nfreqs = Ct.shape[-1], Cf.shape[-1]
-    lam_t, Qt = torch.linalg.eigh(Ct)
-    lam_t = lam_t.clamp_min(0)
-    dinv = Df.rsqrt().to(dt)
-    nu, V = torch.linalg.eigh(dinv[:, None] * Cf * dinv[None, :])
-    nu = nu.clamp_min(0)
-    G = dinv[:, None] * V                                          # Df^-1/2 V, (Nfreqs, Nfreqs)
+
+    # inner (freq) axis: whiten by Df^-1/2, diagonalize -> Gf = Df^-1/2 Uf
+    df_inv = Df.rsqrt().to(dt)
+    mu_f, Uf = torch.linalg.eigh(df_inv[:, None] * Cf * df_inv[None, :])
+    mu_f = mu_f.clamp_min(0)
+    Gf, invDf = df_inv[:, None] * Uf, Df.reciprocal()
+
+    # outer (time) axis: Dt=None -> rotate by Ct's eigenvectors (background r/Df); Dt given -> whiten
+    # by Dt^-1/2 so the background r/(Dt (x) Df) carries full-TIME flags too.
+    if Dt is None:
+        mu_t, Ut = torch.linalg.eigh(Ct)
+        Gt, invDt = Ut, None
+    else:
+        dt_inv = Dt.rsqrt().to(dt)
+        mu_t, Ut = torch.linalg.eigh(dt_inv[:, None] * Ct * dt_inv[None, :])
+        Gt, invDt = dt_inv[:, None] * Ut, Dt.reciprocal()
+    mu_t = mu_t.clamp_min(0)
+
     # keep only the signal modes; the correction (1/denom - 1) is ~0 on the rest, where denom ~= 1
-    kt = lam_t > lam_t[-1] * rcond
-    kf = nu > nu[-1] * rcond
-    Qt_r, G_r = Qt[:, kt].contiguous(), G[:, kf].contiguous()     # (Ntimes, r_t), (Nfreqs, r_f)
-    corr = 1.0 / (lam_t[kt][:, None] * nu[kf][None, :] + 1.0) - 1.0   # (r_t, r_f), the block eigenvalue shift
-    invDf = Df.reciprocal()
-    QtrH, Gc_r, GrT = Qt_r.conj().transpose(-1, -2), G_r.conj(), G_r.transpose(-1, -2)
+    kt = mu_t > mu_t[-1] * rcond
+    kf = mu_f > mu_f[-1] * rcond
+    Gt_r, Gf_r = Gt[:, kt].contiguous(), Gf[:, kf].contiguous()   # (Ntimes, r_t), (Nfreqs, r_f)
+    corr = 1.0 / (mu_t[kt][:, None] * mu_f[kf][None, :] + 1.0) - 1.0   # (r_t, r_f), the block eigenvalue shift
+    GtrH, Gfc_r, GfrT = Gt_r.conj().transpose(-1, -2), Gf_r.conj(), Gf_r.transpose(-1, -2)
 
     def apply_Minv(r):
         R = r.reshape(*r.shape[:-1], Ntimes, Nfreqs)
-        bg = R * invDf                                            # diagonal background (carries the flags)
-        Wc = ((QtrH @ R) @ Gc_r) * corr                          # project onto the r_t x r_f signal block, shift
-        return (bg + Qt_r @ (Wc @ GrT)).reshape(*r.shape[:-1], Ntimes * Nfreqs)   # + reconstruct
+        bg = R * invDf if invDt is None else (R * invDt[:, None]) * invDf   # r / (Dt (x) Df)
+        Wc = ((GtrH @ R) @ Gfc_r) * corr                         # project onto the r_t x r_f signal block, shift
+        return (bg + Gt_r @ (Wc @ GfrT)).reshape(*r.shape[:-1], Ntimes * Nfreqs)   # + reconstruct
     return apply_Minv
 
 
@@ -499,7 +528,7 @@ def kron_lowrank_matvec(Ct, Cf, rcond, diag=None):
 
 
 def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=None, n_threads=1,
-                   return_alpha=False, precond='eigen', sparse_rcond=1e-12):
+                   return_alpha=False, precond='separable', sparse_rcond=1e-12):
     r"""
     Complex Wiener posterior mean  ``m = (Ct (x) Cf) (Ct (x) Cf + diag(noise))^-1 y``  via
     preconditioned CG: structured throughout (never densifies the ``(Ntimes*Nfreqs)^2``
@@ -520,28 +549,31 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
         Preconditioner diagonal shift; default the smallest noise value (the good-pixel
         variance), which makes the preconditioner capture the bulk of ``A``.
     precond : str, optional
-        CG preconditioner: 'eigen' (default) is the scalar-shift Kronecker-eigen preconditioner
-        :func:`kron_eigen_preconditioner`. 'blockdiag' is the block-diagonal
-        :func:`kron_blockdiag_preconditioner` -- exact when the noise is separable across the
-        outer axis (whole inner-axis channels flagged the same at every time), cutting CG to a
-        handful of iterations. It builds the per-channel noise ``Df = min`` over the batch/outer
-        axis and *reverts to 'eigen' automatically* when no channel is fully flagged, so it never
-        does more iterations than 'eigen'. Both 'eigen' and 'blockdiag' are pure preconditioners
-        (they never change the solution, only the iteration count). 'sparse_blockdiag' is different:
-        it applies the blockdiag preconditioner in low-rank form
-        (:func:`kron_sparse_blockdiag_preconditioner`) AND applies the signal operator itself in
+        CG preconditioner: 'scalar' is the scalar-shift Kronecker-eigen preconditioner
+        :func:`kron_homoscedastic_preconditioner`. 'separable' (default) is the separable-noise
+        :func:`kron_heteroscedastic_preconditioner` -- it captures the full-flag structure on BOTH
+        axes (the per-channel floor ``Df = min`` over batch/time for whole flagged **channels**, and
+        the per-time floor ``Dt = min`` over batch/freq for whole flagged **time integrations**),
+        exact (1 iteration) when the noise is exactly separable ``Dt (x) Df``. It cascades to the
+        per-channel-only form when no full-time flag is present, and *reverts to 'scalar'
+        automatically* when neither axis has a full flag, so it never does more iterations than
+        'scalar'. Both are pure preconditioners (they never change the solution, only the
+        iteration count); non-separable structure -- scatter, or PARTIALLY-flagged channels/times --
+        is not captured and falls to CG. 'sparse_separable' is different:
+        it applies the same separable-noise preconditioner (both Dt and Df) in low-rank form
+        (:func:`kron_sparse_heteroscedastic_preconditioner`) AND applies the signal operator itself in
         low-rank form (:func:`kron_lowrank_matvec`), both truncated at ``sparse_rcond`` -- a much
         cheaper per-iteration CG for low-rank (smooth / band-limited) kernels. Because it truncates
         the *operator*, it is a low-rank (approximate) solve like :func:`kron_woodbury_predict`
         rather than an exact one: the accuracy is set by ``sparse_rcond`` (validate in the science
         space), exact as ``sparse_rcond -> 0``. The final mean is reconstructed at full rank.
     sparse_rcond : float, optional
-        Relative eigenvalue cutoff for ``precond='sparse_blockdiag'`` (ignored otherwise): the
+        Relative eigenvalue cutoff for ``precond='sparse_separable'`` (ignored otherwise): the
         low-rank signal operator and preconditioner keep time / (whitened-)freq modes above
         ``sparse_rcond * lambda_max``. Smaller keeps more modes (more accurate operator, stronger
-        preconditioner, fewer iterations, costlier apply; ``-> 0`` recovers the exact 'blockdiag'
+        preconditioner, fewer iterations, costlier apply; ``-> 0`` recovers the exact 'separable'
         solve); larger truncates more (cheaper apply, but a less accurate answer and possibly more
-        iterations). The default is tight so the answer and iteration count both track 'blockdiag';
+        iterations). The default is tight so the answer and iteration count both track 'separable';
         loosen it only while the result and the returned ``iters`` stay acceptable. Default 1e-12.
     tol, max_iter, x0
         Forwarded to :func:`pcg`. The stop test uses the inverse-variance-weighted relative
@@ -579,31 +611,46 @@ def kron_wiener_cg(Ct, Cf, noise, y, shift=None, tol=1e-6, max_iter=1000, x0=Non
     # Built ONCE (one eigh per axis) and shared across all baselines / threads.
     if shift is None:
         shift = float(noise_f.real.amin())
-    if precond == 'eigen':
-        M = kron_eigen_preconditioner(Ct, Cf, shift=shift)
-    elif precond == 'blockdiag':
-        # per-channel (inner-axis) noise = min over the batch & outer (time) axis: the
-        # time-independent part, large on fully-flagged channels. If no channel is fully flagged
-        # (Df uniform) M IS the scalar-shift preconditioner, so fall back to the cheaper eigen
-        # apply -- identical iterations, no per-iteration overhead.
-        Df = noise.reshape(-1, Nfreqs).real.amin(dim=0)
-        M = (kron_blockdiag_preconditioner(Ct, Cf, Df) if bool((Df > Df.amin()).any())
-             else kron_eigen_preconditioner(Ct, Cf, shift=shift))
-    elif precond == 'sparse_blockdiag':
-        # low-rank blockdiag: a diagonal background (r/Df, which still carries the full-channel
-        # flags) plus a rank-(r_t*r_f) correction on only the signal modes kept at sparse_rcond --
-        # far cheaper per apply than 'blockdiag' when the kernels are low rank. Same Df.
-        Df = noise.reshape(-1, Nfreqs).real.amin(dim=0)
-        M = kron_sparse_blockdiag_preconditioner(Ct, Cf, Df, rcond=sparse_rcond)
+    if precond == 'scalar':
+        M = kron_homoscedastic_preconditioner(Ct, Cf, shift=shift)
+    elif precond == 'separable':
+        # separable noise floor diag(Dt) (x) diag(Df): the per-channel floor Df = min over the
+        # batch & outer (time) axis (large on fully-flagged channels) and the per-time floor
+        # Dt = min over the batch & inner (freq) axis (large on fully-flagged time integrations),
+        # so CG skips full-channel AND full-time flags. Cascade to the cheaper form when an axis
+        # has no full flag: per-channel-only (no full-time flag) or scalar-shift homoscedastic
+        # (neither) -- same result, fewer setup ops.
+        n2 = noise.reshape(-1, Ntimes, Nfreqs).real
+        Df = n2.amin(dim=(0, 1))                                   # per-channel floor
+        Dt = n2.amin(dim=(0, 2))                                   # per-time floor
+        gmin = Df.amin()                                           # global good-pixel value
+        if bool((Dt > gmin).any()):                               # full-time flags present
+            M = kron_heteroscedastic_preconditioner(Ct, Cf, Df / gmin, Dt=Dt)
+        elif bool((Df > gmin).any()):                             # only full-channel flags
+            M = kron_heteroscedastic_preconditioner(Ct, Cf, Df)
+        else:                                                     # no full flag on either axis
+            M = kron_homoscedastic_preconditioner(Ct, Cf, shift=shift)
+    elif precond == 'sparse_separable':
+        # low-rank separable: a diagonal background r/(Dt (x) Df) (carries full-channel AND full-time
+        # flags) plus a rank-(r_t*r_f) correction on only the signal modes kept at sparse_rcond -- far
+        # cheaper per apply than 'separable' when the kernels are low rank. Same Dt/Df floors.
+        n2 = noise.reshape(-1, Ntimes, Nfreqs).real
+        Df = n2.amin(dim=(0, 1))
+        Dt = n2.amin(dim=(0, 2))
+        gmin = Df.amin()
+        if bool((Dt > gmin).any()):                               # full-time flags -> both-axis background
+            M = kron_sparse_heteroscedastic_preconditioner(Ct, Cf, Df / gmin, Dt=Dt, rcond=sparse_rcond)
+        else:                                                     # per-channel-only background r/Df
+            M = kron_sparse_heteroscedastic_preconditioner(Ct, Cf, Df, rcond=sparse_rcond)
     else:
-        raise ValueError(f"precond must be 'eigen', 'blockdiag' or 'sparse_blockdiag', got {precond!r}")
+        raise ValueError(f"precond must be 'scalar', 'separable' or 'sparse_separable', got {precond!r}")
 
-    # operator matvec A = (Ct (x) Cf) + diag(noise). For 'sparse_blockdiag' the signal is applied in
+    # operator matvec A = (Ct (x) Cf) + diag(noise). For 'sparse_separable' the signal is applied in
     # its low-rank form (Ct (x) Cf)_r = A_t (A_t^H X A_f^*) A_f^T via truncated eigenfactors (built
     # ONCE, shared across chunks) -- much cheaper per CG iteration, but it TRUNCATES the operator
     # (accuracy set by sparse_rcond, exact as it -> 0), unlike the preconditioner which never
     # changes the answer. The mean reconstruction below stays full-rank (done once).
-    if precond == 'sparse_blockdiag':
+    if precond == 'sparse_separable':
         dtc = torch.promote_types(Ct.dtype, Cf.dtype)
         At, Af = _lowrank_factor(Ct, sparse_rcond).to(dtc), _lowrank_factor(Cf, sparse_rcond).to(dtc)
         AtH, Afc, AfT = At.conj().transpose(-1, -2), Af.conj(), Af.transpose(-1, -2)
@@ -1011,7 +1058,7 @@ def cg_batched(C, N, B=None, y=None, rcond=1e-15, cg_tol=1e-6, cg_max_iter=1000,
     same rank-reduced system as :func:`woodbury_batched` and agrees with it to ``cg_tol``). The
     preconditioner is the Woodbury inverse of ``U U^H + diag(Dshared)`` built ONCE from
     ``Dshared = min_b N_b`` -- the per-channel noise that is large only on channels flagged across
-    the *whole* batch (the same quantity the 2D 'blockdiag' preconditioner uses). When the flags are
+    the *whole* batch (the same quantity the 2D 'separable' preconditioner uses). When the flags are
     (near-)vertical -- fully-flagged channels common to every spectrum, e.g. the ``2d_1d`` final
     frequency solve -- this shared factor captures the bulk of every ``A_b`` and CG only cleans up
     the per-spectrum scatter, so the iteration count scales with the *scatter*, not ``rank(C)``. That

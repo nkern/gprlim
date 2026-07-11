@@ -29,7 +29,7 @@ def hera_inpaint(
     lk_buffer=150.0,
     kernel_var_mult=3,
     noise_mult=100,
-    precond_2d='sparse_blockdiag',
+    precond_2d='sparse_separable',
     sparse_rcond=1e-12,
     red_avg_2d=True,
     cg_tol=1e-3,
@@ -91,9 +91,9 @@ def hera_inpaint(
         Noise-inflation factor applied to first-guess-filled pixels so they act as a soft
         prior in the following 1D stage. Default 100.
     precond_2d : str, optional
-        CG preconditioner for the 2D stage: 'sparse_blockdiag' (default), 'blockdiag' or 'eigen'.
+        CG preconditioner for the 2D stage: 'sparse_separable' (default), 'separable' or 'scalar'.
     sparse_rcond : float, optional
-        Eigenvalue cutoff for ``precond_2d='sparse_blockdiag'``. Default 1e-12.
+        Eigenvalue cutoff for ``precond_2d='sparse_separable'``. Default 1e-12.
     cg_tol : float, optional
         CG tolerance for the 2D stage. Default 1e-3.
     n_threads : int, optional
@@ -310,7 +310,7 @@ def inpaint_2d_then_1d_freq(
     flags,
     method_2d='cg',
     method_1d='woodbury',
-    precond='blockdiag',
+    precond='separable',
     red_avg_2d=True,
     noise_mult=100,
     rcond_2d=1e-13,
@@ -355,8 +355,8 @@ def inpaint_2d_then_1d_freq(
         Solver for the 1D frequency stage: 'woodbury' (default) or 'cholesky' (see
         :func:`gprlim.models.posterior_mean_1d`).
     precond : str, optional
-        CG preconditioner for the 2D stage: 'blockdiag' (default), 'eigen', or
-        'sparse_blockdiag'; used only when ``method_2d='cg'``.
+        CG preconditioner for the 2D stage: 'separable' (default), 'scalar', or
+        'sparse_separable'; used only when ``method_2d='cg'``.
     red_avg_2d : bool, optional
         If True (default), run the 2D stage on the gain-normalized redundant average; if
         False, run it on ``data`` directly.
@@ -370,7 +370,7 @@ def inpaint_2d_then_1d_freq(
         CG controls for the 2D stage (``method_2d='cg'``), forwarded to
         :func:`gprlim.models.inpaint_2d`.
     sparse_rcond : float, optional
-        Eigenvalue cutoff for ``precond='sparse_blockdiag'`` in the 2D stage (ignored
+        Eigenvalue cutoff for ``precond='sparse_separable'`` in the 2D stage (ignored
         otherwise). Default 1e-12.
     freq_1d : bool, optional
         Apply 1D frequency inpainting after 2D inpaint
