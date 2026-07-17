@@ -1573,7 +1573,8 @@ def to_eigen(kernel, x, unravel=False, rcond=1e-12):
 def default_time_kernel(
     freqs, bl_vec, lat, buffer=None, hw_mult=1.0, min_hw=0.5,
     ml_scale=1e2, fz_scale=1e-1, fr_scale=3e-3,
-    only_amp=True, only_global_amp=False, parameter=True, flip_sign=False
+    only_amp=True, only_global_amp=False, parameter=True, flip_sign=False,
+    device=None,
     ):
     r"""
     Default complex time (fringe-rate) kernel for a baseline, a sum of three components:
@@ -1725,7 +1726,7 @@ def default_time_kernel(
     if not parameter:
         K.raw_outputscale.requires_grad_(False)
 
-    return K
+    return K.to(device)
 
 
 def default_freq_kernel(
@@ -1743,7 +1744,9 @@ def default_freq_kernel(
     rf_width=None,
     only_amp=True,
     only_global_amp=False,
-    parameter=True):
+    parameter=True,
+    device=None
+    ):
     r"""
     Default frequency kernel composed of
 
@@ -1983,7 +1986,7 @@ def default_freq_kernel(
     if not parameter:
         K.raw_outputscale.requires_grad_(False)
 
-    return K
+    return K.to(device)
 
 
 def multi_kernel_mixture(

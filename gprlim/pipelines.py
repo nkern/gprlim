@@ -34,11 +34,13 @@ def hera_inpaint(
     red_avg_2d=True,
     cg_tol=1e-3,
     n_threads=16,
+    method_1d='woodbury',
     rcond_1d=1e-12,
     flag_Ntimes=50,
     rf_scale=None,
     rf_tau=None,
     rf_width=None,
+    device=None,
     ):
     """
     All purpose inpainting function for drift-scan, redundant radio visibilities.
@@ -98,6 +100,8 @@ def hera_inpaint(
         CG tolerance for the 2D stage. Default 1e-3.
     n_threads : int, optional
         Threads for the batched 2D CG solve. Default 16.
+    method_1d : str, optional
+        Method for 1D GP: ['woodbury', 'cholesky']
     rcond_1d : float, optional
         Low-rank / truncation cutoff for the 1D solvers. Default 1e-12.
     flag_Ntimes : int, optional
@@ -118,6 +122,13 @@ def hera_inpaint(
     mdl : tensor
         The full posterior-mean model from the final inpaint stage.
     """
+    ## check for tensors
+    data = torch.as_tensor(data).to(device)
+    noise_var = torch.as_tensor(noise_var).to(device)
+    flags = torch.as_tensor(flags).to(device)
+    times = torch.as_tensor(times).to(device)
+    freqs = toch.as_tensor(freqs).to(device)
+
     ## first normalize data if needed
     if norm_freq_alpha is not None:
         scale = (freqs / freqs.mean())**norm_freq_alpha
@@ -131,8 +142,11 @@ def hera_inpaint(
             inpaint=inpaint, fr_buffer=fr_buffer, fr_scale=fr_scale, fz_scale=fz_scale,
             pf_scale=pf_scale, wd_scale=wd_scale, lk_scale=lk_scale, lk_buffer=lk_buffer,
             kernel_var_mult=kernel_var_mult, norm_freq_alpha=None,
-            rf_scale=rf_scale, rf_tau=rf_tau, rf_width=rf_width,
+            rf_scale=rf_scale, rf_tau=rf_tau, rf_width=rf_width, device=device
         )
+    else:
+        time_kernel = time_kernel.to(device)
+        freq_kernel = freq_kernel.to(device)
 
     ## now run the inpainting
     if inpaint in ['2d', '2d_1d']:
@@ -142,7 +156,7 @@ def hera_inpaint(
             time_kernel, freq_kernel, times, freqs, data, noise_var, flags,
             method_2d='cg', precond=precond_2d, sparse_rcond=sparse_rcond,
             red_avg_2d=red_avg_2d, cg_tol=cg_tol, cg_max_iter=10000,
-            n_threads=n_threads, method_1d='woodbury', rcond_1d=rcond_1d,
+            n_threads=n_threads, method_1d=method_1d, rcond_1d=rcond_1d,
             freq_1d=freq_1d, noise_mult=noise_mult,
             )
 
@@ -152,7 +166,7 @@ def hera_inpaint(
 
         inp_y, mdl = inpaint_time_1d_then_freq_1d(
             time_kernel, freq_kernel, times, freqs, data, noise_var, flags,
-            method='woodbury', rcond=rcond_1d, noise_mult=noise_mult,
+            method=method_1d, rcond=rcond_1d, noise_mult=noise_mult,
             flag_Ntimes=flag_Ntimes, freq_1d=freq_1d, time_1d=time_1d
             )
 
@@ -188,7 +202,8 @@ def build_kernels(
     parameter=False,
     rf_scale=None,
     rf_tau=None,
-    rf_width=None
+    rf_width=None,
+    device=None
     ):
     """
     Build the time (fringe-rate) and frequency (delay) kernels for drift-scan radio
@@ -261,13 +276,14 @@ def build_kernels(
     time_kernel = kernels.default_time_kernel(
         freqs*1e6, bl_vec, lat, ml_scale=1e0, fz_scale=fz_scale, fr_scale=fr_scale,
         buffer=fr_buffer, only_amp=only_amp, parameter=parameter, flip_sign=flip_sign,
+        device=device,
     )
 
     freq_kernel = kernels.default_freq_kernel(
         bl_vec, ml_scale=1e0, pf_scale=pf_scale, wd_scale=wd_scale, lk_scale=lk_scale, 
         pf_real=True, lk_kern='twinrbf', buffer=lk_buffer, min_delay=50.0,
-        only_amp=only_amp, parameter=parameter,
-        rf_scale=rf_scale, rf_tau=rf_tau, rf_width=rf_width,
+        only_amp=only_amp, parameter=parameter, rf_scale=rf_scale, rf_tau=rf_tau,
+        rf_width=rf_width, device=device,
     )
 
     if norm_freq_alpha is not None:

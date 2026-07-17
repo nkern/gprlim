@@ -33,7 +33,7 @@ def mean_center(y, noise, dim=-1):
 
 def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend=False,
                       rcond=1e-15, method='cholesky', chunk=None, pred_kernel=None,
-                      cg_tol=1e-6, cg_max_iter=1000):
+                      cg_tol=1e-4, cg_max_iter=1000):
     """
     GP posterior mean (Wiener filter) ``Cp (Cs + diag(noise))^-1 (y - mu) + mu`` along one
     axis of ``y``, batched over all the others.
