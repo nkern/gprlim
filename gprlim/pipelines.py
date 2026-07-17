@@ -127,7 +127,7 @@ def hera_inpaint(
     noise_var = torch.as_tensor(noise_var).to(device)
     flags = torch.as_tensor(flags).to(device)
     times = torch.as_tensor(times).to(device)
-    freqs = toch.as_tensor(freqs).to(device)
+    freqs = torch.as_tensor(freqs).to(device)
 
     ## first normalize data if needed
     if norm_freq_alpha is not None:
