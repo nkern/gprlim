@@ -916,7 +916,26 @@ def _eigh_solve(A, rhs, rcond):
     return V @ (winv.unsqueeze(-1) * (V.transpose(-1, -2) @ rhs))
 
 
-def woodbury_batched(C, N, B=None, y=None, rcond=1e-15):
+def _rep_expand(N, nrep):
+    """Tile a deduped ``(bN, n)`` noise back to ``y``'s ``(nrep*bN, n)`` row layout (replica
+    index slow). Used for the O(b n) elementwise steps, which are cheap at full size."""
+    return N if nrep == 1 else N.repeat(nrep, 1)
+
+
+def _group_rhs(v, nrep):
+    """Group replicas into trailing columns for a batched solve against ``bN`` shared factors:
+    ``(nrep*bN, m) -> (bN, m, nrep)`` (replica index slow in the input)."""
+    bN = v.shape[0] // nrep
+    return v.reshape(nrep, bN, -1).permute(1, 2, 0)
+
+
+def _ungroup(v, nrep):
+    """Inverse of :func:`_group_rhs`: ``(bN, m, nrep) -> (nrep*bN, m)``."""
+    m = v.shape[1]
+    return v.permute(2, 0, 1).reshape(-1, m)
+
+
+def woodbury_batched(C, N, B=None, y=None, rcond=1e-15, nrep=1):
     """
     Batched Woodbury solve of (C + diag(N_b))^-1 over a batch of noise
     diagonals N sharing a single low-rank covariance C. Fast when the
@@ -939,11 +958,20 @@ def woodbury_batched(C, N, B=None, y=None, rcond=1e-15):
         Observations (Nbatch, n).
     rcond : float
         Relative eigenvalue cutoff for the rank of C.
+    nrep : int
+        Replication factor when ``N`` holds only the ``bN`` *distinct* noise rows and ``y`` has
+        ``nrep*bN`` rows (replica index slow) -- e.g. a shared ``(1, Ntimes, Nfreqs)`` noise
+        against ``(Nbls, Ntimes, Nfreqs)`` data. Only ``bN`` capacitances are built and factored,
+        with the replicas solved as extra right-hand sides (an ``nrep``-fold saving in the
+        ``O(b n k^2)`` capacitance build). Requires ``y``.
 
     Returns
     -------
     tensor
     """
+    if nrep != 1 and y is None:
+        raise ValueError("nrep > 1 requires y (the no-y full-inverse path is per-system)")
+
     # low-rank factor of the signal covariance, keeping the modes above the
     # rcond cutoff: C ~= U U^H, with k = effective rank (U is complex if C is)
     evals, evecs = torch.linalg.eigh(C)
@@ -964,15 +992,20 @@ def woodbury_batched(C, N, B=None, y=None, rcond=1e-15):
     # without ever forming the (n, n) inverse
     if y is not None:
 
-        # whiten y by the noise, then project into the low-rank subspace
-        Dy = Ninv * y  # (b, n)
-        rhs = torch.einsum('nk,bn->bk', U.conj(), Dy).unsqueeze(-1)
+        # whiten y by the noise, then project into the low-rank subspace. The elementwise steps
+        # are O(b n) so they run at full size; only the capacitance solve uses the deduped factors.
+        Ninv_y = _rep_expand(Ninv, nrep)                          # (nrep*bN, n)
+        Dy = Ninv_y * y  # (b, n)
+        rhs = torch.einsum('nk,bn->bk', U.conj(), Dy)             # (b, k)
 
-        # solve the small (k, k) capacitance system
-        z = torch.cholesky_solve(rhs, L).squeeze(-1)  # (b, k)
+        # solve the small (k, k) capacitance system (bN shared factors, nrep RHS each)
+        if nrep == 1:
+            z = torch.cholesky_solve(rhs.unsqueeze(-1), L).squeeze(-1)  # (b, k)
+        else:
+            z = _ungroup(torch.cholesky_solve(_group_rhs(rhs, nrep), L), nrep)
 
         # reconstruct alpha_b = (C + diag(N_b))^-1 y_b
-        alpha = Dy - Ninv * torch.einsum('nk,bk->bn', U, z)  # (b, n)
+        alpha = Dy - Ninv_y * torch.einsum('nk,bk->bn', U, z)  # (b, n)
 
         # optionally pre-multiply by B (e.g. the cross-covariance K(x*, X))
         return alpha if B is None else torch.einsum('mn,bn->bm', B, alpha)
@@ -988,7 +1021,7 @@ def woodbury_batched(C, N, B=None, y=None, rcond=1e-15):
     return inv if B is None else torch.einsum('rp,bpq->brq', B, inv)
 
 
-def cholesky_batched(C, N, B=None, y=None, rcond=1e-15):
+def cholesky_batched(C, N, B=None, y=None, rcond=1e-15, nrep=1):
     """
     Batched Cholesky solve of (C + diag(N_b))^-1 over a batch of noise
     diagonals N sharing a covariance C. General-purpose default: no low-rank
@@ -1010,16 +1043,24 @@ def cholesky_batched(C, N, B=None, y=None, rcond=1e-15):
         Observations (Nbatch, n).
     rcond : float
         Relative eigenvalue cutoff for the non-PD fallback.
+    nrep : int
+        Replication factor when ``N`` holds only the ``bN`` *distinct* noise rows and ``y`` has
+        ``nrep*bN`` rows (replica index slow) -- e.g. a shared ``(1, Ntimes, Nfreqs)`` noise
+        against ``(Nbls, Ntimes, Nfreqs)`` data. Only ``bN`` dense ``(n, n)`` systems are built
+        and factored instead of ``nrep*bN``, with the replicas solved as extra right-hand sides
+        (an ``nrep``-fold cut in the dominant ``O(b n^2)`` memory). Requires ``y``.
 
     Returns
     -------
     tensor
     """
+    if nrep != 1 and y is None:
+        raise ValueError("nrep > 1 requires y (the no-y full-inverse path is per-system)")
     n = C.shape[-1]
 
     # build the batched system A_b = C + diag(N_b) and attempt a Cholesky;
     # cholesky_ex flags (info > 0) any element that is not positive-definite
-    A = C.unsqueeze(0) + torch.diag_embed(N)  # (b, n, n)
+    A = C.unsqueeze(0) + torch.diag_embed(N)  # (bN, n, n)
     L, info = torch.linalg.cholesky_ex(A)
     bad = info > 0
     good = ~bad
@@ -1034,9 +1075,13 @@ def cholesky_batched(C, N, B=None, y=None, rcond=1e-15):
             sol[bad] = _eigh_solve(A[bad], rhs[bad], rcond)
         return sol
 
-    # y-path: solve against y_b directly, optionally pre-multiply by B
+    # y-path: solve against y_b directly, optionally pre-multiply by B. With nrep > 1 the
+    # replicas sharing a system become extra columns, so each factor is reused nrep times.
     if y is not None:
-        alpha = _solve(y.unsqueeze(-1)).squeeze(-1)  # (b, n)
+        if nrep == 1:
+            alpha = _solve(y.unsqueeze(-1)).squeeze(-1)  # (b, n)
+        else:
+            alpha = _ungroup(_solve(_group_rhs(y, nrep)), nrep)
         return alpha if B is None else torch.einsum('mn,bn->bm', B, alpha)
 
     # no-y path: solve against the identity to get the full inverse per batch
@@ -1121,7 +1166,7 @@ def cg_batched(C, N, B=None, y=None, rcond=1e-15, cg_tol=1e-6, cg_max_iter=1000,
 
 
 def gpr_invert(C, N, B=None, y=None, rcond=1e-15, method='cholesky', chunk=None,
-               cg_tol=1e-6, cg_max_iter=1000, info=None):
+               cg_tol=1e-6, cg_max_iter=1000, info=None, nrep=1):
     """
     Perform (C + N)^-1 where C is low-rank
     and N is diagonal using Woodbury identity.
@@ -1153,11 +1198,17 @@ def gpr_invert(C, N, B=None, y=None, rcond=1e-15, method='cholesky', chunk=None,
         CG tolerance / iteration cap for ``method='cg'`` (see :func:`cg_batched`).
     info : dict, optional
         For ``method='cg'``, updated in place with ``cg_iters`` / ``resid``.
+    nrep : int
+        Replication factor when ``N`` holds only the ``bN`` distinct noise rows and ``y`` has
+        ``nrep*bN`` rows (replica index slow); see :func:`cholesky_batched` /
+        :func:`woodbury_batched`. ``method='cg'`` is O(b n) in memory so it simply expands.
 
     Returns
     -------
     tensor
     """
+    if nrep != 1:
+        assert N.ndim == 2 and y is not None, "nrep > 1 requires a batched N and a y"
     if N.ndim == 1:
         # single system: pinv (robust to non-PSD)
         out = torch.linalg.pinv(C + N.diag(), hermitian=True, rcond=rcond)
@@ -1178,21 +1229,31 @@ def gpr_invert(C, N, B=None, y=None, rcond=1e-15, method='cholesky', chunk=None,
             ])
 
         elif method == 'cg':
-            # C shared, N batched, high-rank C / near-shared flags: preconditioned CG
-            out = cg_batched(C, N, B=B, y=y, rcond=rcond,
+            # C shared, N batched, high-rank C / near-shared flags: preconditioned CG.
+            # CG never forms an (n, n), so the dedup buys nothing -- just expand to y's rows.
+            out = cg_batched(C, _rep_expand(N, nrep), B=B, y=y, rcond=rcond,
                              cg_tol=cg_tol, cg_max_iter=cg_max_iter, info=info)
 
         else:
             # C shared, N batched: vectorized direct solve (the main driver)
             solver = {'woodbury': woodbury_batched, 'cholesky': cholesky_batched}[method]
             if chunk is None:
-                out = solver(C, N, B=B, y=y, rcond=rcond)
+                out = solver(C, N, B=B, y=y, rcond=rcond, nrep=nrep)
             else:
-                out = torch.cat([
-                    solver(C, N[i:i + chunk], B=B,
-                           y=None if y is None else y[i:i + chunk], rcond=rcond)
-                    for i in range(0, len(N), chunk)
-                ], dim=0)
+                # chunk over the DISTINCT systems, slicing each replica's matching rows of y;
+                # re-assemble on the system axis so the replica-slow row order is preserved
+                bN, ny = N.shape[0], (None if y is None else y.shape[-1])
+                yg = None if y is None else y.reshape(nrep, bN, ny)
+                parts = [
+                    solver(C, N[i:i + chunk], B=B, rcond=rcond, nrep=nrep,
+                           y=None if y is None else yg[:, i:i + chunk].reshape(-1, ny))
+                    for i in range(0, bN, chunk)
+                ]
+                if nrep == 1:
+                    out = torch.cat(parts, dim=0)
+                else:
+                    m = parts[0].shape[-1]
+                    out = torch.cat([p.reshape(nrep, -1, m) for p in parts], dim=1).reshape(-1, m)
 
     return out
 

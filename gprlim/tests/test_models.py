@@ -18,6 +18,7 @@ from gprlim.models import (
     cholesky_batched,
     batched_log_prob,
     _sum_log_priors,
+    _dedup_noise,
     mean_center,
     posterior_mean_1d,
     posterior_mean_2d,
@@ -367,6 +368,47 @@ def test_posterior_mean_1d_cg():
         # DeltaKernel amplifies the residual->error gap (~1.5e-4 here), so allow 5e-4 of headroom
         assert torch.allclose(mc, mw, atol=5e-4)
         assert info['cg_iters'] >= 1
+
+
+def test_posterior_mean_1d_broadcast_noise():
+    """A noise broadcasting along leading axes -- e.g. a shared (1, Ntimes, Nfreqs) against
+    (Nbls, Ntimes, Nfreqs) data -- is deduped to its distinct rows, so the solvers factorize
+    Ntimes systems instead of Nbls*Ntimes and reuse each factor across the Nbls replicas (an
+    Nbls-fold cut in the dominant O(b n^2) cholesky memory / O(b n k^2) woodbury capacitance).
+    The results must be bit-for-bit equivalent to passing the fully-expanded noise."""
+    torch.manual_seed(0)
+    Nbls, Nt, Nf = 4, 6, 32
+    nu = torch.linspace(120, 180, Nf, dtype=torch.float64)
+    kc = kernels.CarrierKernel(kernels.ScaleKernel(kernels.RBFKernel()), tau=0.05).double()
+    kc.base_kernel.base_kernel.lengthscale = 3.0
+    kr = kernels.ScaleKernel(kernels.RBFKernel()).double(); kr.base_kernel.lengthscale = 3.0
+
+    y = torch.randn(Nbls, Nt, Nf, dtype=torch.cdouble)
+    nb = 0.1 + 0.05 * torch.rand(1, Nt, Nf, dtype=torch.float64)   # shared across Nbls
+    nb[:, :, ::7] = 1e10                                           # vertical (channel) flags
+    nfull = nb.expand(Nbls, Nt, Nf).contiguous()
+
+    # detection: only the (Ntimes, Nfreqs) distinct rows survive, with nrep = Nbls
+    nf, nrep = _dedup_noise(nb, y, -1, Nf)
+    assert nf.shape == (Nt, Nf) and nrep == Nbls
+    # a non-leading broadcast (shared over TIME, not baseline) is not deduped -> expanded path
+    _, nrep_t = _dedup_noise(0.1 + torch.rand(Nbls, 1, Nf, dtype=torch.float64), y, -1, Nf)
+    assert nrep_t == 1
+
+    # identical results for every method, on both the complex-kernel and stacked real/imag paths
+    # (the real/imag stack folds another factor of 2 into nrep, since both halves share a system)
+    for kern in (kc, kr):
+        for method in ('cholesky', 'woodbury', 'cg'):
+            a = posterior_mean_1d(kern, nu, y, nb, method=method)[0]
+            b = posterior_mean_1d(kern, nu, y, nfull, method=method)[0]
+            assert torch.allclose(a, b, atol=1e-12), (kern, method)
+
+    # ... and with the options that touch the row layout: detrend, chunking, off-grid prediction
+    for kw in ({'detrend': True}, {'chunk': 2},
+               {'pred_x': torch.linspace(125, 175, 9, dtype=torch.float64)}):
+        a = posterior_mean_1d(kc, nu, y, nb, method='woodbury', **kw)[0]
+        b = posterior_mean_1d(kc, nu, y, nfull, method='woodbury', **kw)[0]
+        assert torch.allclose(a, b, atol=1e-12), kw
 
 
 def test_posterior_mean_2d():

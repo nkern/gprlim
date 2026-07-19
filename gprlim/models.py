@@ -3,7 +3,7 @@ import math
 import torch
 
 from .solvers import (stack_ri, unstack_ri, promote_like, shrink, kron_cholesky,
-                      gpr_invert, cholesky_batched,
+                      gpr_invert, cholesky_batched, _rep_expand,
                       kron_woodbury_predict, kron_wiener_cg)
 
 
@@ -29,6 +29,37 @@ def mean_center(y, noise, dim=-1):
     """
     w = noise.pow(-1)
     return (y * w).sum(dim, keepdim=True) / w.sum(dim, keepdim=True)
+
+
+def _dedup_noise(noise, y, dim, Nx):
+    """Flatten ``noise`` to solver rows, exploiting a leading-axis broadcast when there is one.
+
+    If ``noise`` broadcasts against ``y`` purely along a *leading* prefix of axes (e.g. a shared
+    ``(1, Ntimes, Nfreqs)`` noise against ``(Nbls, Ntimes, Nfreqs)`` data) then only ``bN``
+    distinct systems exist; return those rows plus the replication factor ``nrep`` so the solvers
+    factorize ``bN`` systems instead of ``nrep*bN`` and reuse each factor across its replicas.
+    Any other broadcast pattern falls back to the fully-expanded rows with ``nrep = 1``.
+
+    Returns
+    -------
+    (nf, nrep) : tensor of shape (bN, Nx), int
+    """
+    nshape = (1,) * (y.ndim - noise.ndim) + tuple(noise.shape)      # right-align to y
+    perm = list(range(y.ndim))
+    perm.append(perm.pop(dim % y.ndim))                             # same movedim as y
+    ns = [nshape[i] for i in perm][:-1]                             # batch axes, post-movedim
+    ys = [y.shape[i] for i in perm][:-1]
+
+    # leading axes that are broadcast (noise 1, y > 1); the remainder must match exactly
+    k = 0
+    while k < len(ns) and ns[k] == 1 and ys[k] != 1:
+        k += 1
+
+    nfp = torch.broadcast_to(noise, y.shape).movedim(dim, -1)
+    if k == 0 or any(a != b for a, b in zip(ns[k:], ys[k:])):
+        return nfp.reshape(-1, Nx), 1
+    # index the stride-0 replica axes away: only the (bN, Nx) distinct rows are materialized
+    return nfp[(0,) * k].reshape(-1, Nx), math.prod(ys[:k])
 
 
 def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend=False,
@@ -89,13 +120,13 @@ def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend
     info = {}
     x = torch.as_tensor(x).reshape(-1)
     Nx = x.shape[-1]
-    # move the sample axis to last and flatten the remaining axes into one batch; noise is
-    # broadcast to y's shape first (so a shared (1, ...) / lower-rank noise lines up per row)
-    noise = torch.broadcast_to(noise, y.shape)
+    # move the sample axis to last and flatten the remaining axes into one batch. A noise that
+    # broadcasts along leading axes (e.g. (1, Ntimes, Nfreqs)) keeps only its distinct rows, with
+    # `nrep` telling the solver how many y-rows share each system (see :func:`_dedup_noise`).
     yp = y.movedim(dim, -1)
     lead = yp.shape[:-1]
     yf = yp.reshape(-1, Nx)
-    nf = noise.movedim(dim, -1).reshape(-1, Nx)
+    nf, nrep = _dedup_noise(torch.as_tensor(noise), y, dim, Nx)
 
     with torch.no_grad():
         # get dense kernel
@@ -111,19 +142,23 @@ def posterior_mean_1d(kernel, x, y, noise, pred_x=None, mu=None, dim=-1, detrend
 
         trend = 0.0
         if detrend:
-            trend = mean_center(yc, nf, dim=-1)          # nf/-1: yc is moved to (..., Nx)
+            # mean_center is per-row, so it needs the noise at y's full row count
+            trend = mean_center(yc, _rep_expand(nf, nrep), dim=-1)   # nf/-1: yc is (..., Nx)
             yc = yc - trend
 
         # real covariance + complex data -> stack real/imag, two real solves, recombine;
         # otherwise solve directly (promoting a real cov to complex for complex data).
         if yc.is_complex() and not Cs.is_complex():
-            yc, nf = stack_ri(yc), torch.cat([nf, nf], 0)
+            # the real/imag stack is itself a replication of the same noise (real & imag share a
+            # system), so fold its factor of 2 into nrep rather than duplicating the noise rows
+            yc, nrep = stack_ri(yc), 2 * nrep
             pred = unstack_ri(gpr_invert(Cs, nf, B=Cp, y=yc, rcond=rcond, method=method, chunk=chunk,
-                                         cg_tol=cg_tol, cg_max_iter=cg_max_iter, info=info))
+                                         cg_tol=cg_tol, cg_max_iter=cg_max_iter, info=info,
+                                         nrep=nrep))
         else:
             Cs, Cp = promote_like(Cs, yc), promote_like(Cp, yc)
             pred = gpr_invert(Cs, nf, B=Cp, y=yc, rcond=rcond, method=method, chunk=chunk,
-                              cg_tol=cg_tol, cg_max_iter=cg_max_iter, info=info)
+                              cg_tol=cg_tol, cg_max_iter=cg_max_iter, info=info, nrep=nrep)
         pred = pred + mu_pred + trend
 
     return pred.reshape(*lead, pred.shape[-1]).movedim(-1, dim), info
